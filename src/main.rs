@@ -9,8 +9,12 @@ use log::{warn, LevelFilter};
 use std::{
     fs,
     path::{Path, PathBuf},
+    str::FromStr,
 };
-use yubihsm::{Client, Connector, Credentials, UsbConfig};
+use yubihsm::{
+    object::{Id, Type},
+    Client, Connector, Credentials, UsbConfig,
+};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -87,6 +91,20 @@ enum HsmCommand {
         key_spec: PathBuf,
     },
 
+    /// Generate JSON description of a key in the HSM.
+    Backup {
+        #[clap(long, env)]
+        id: Id,
+
+        #[clap(long, env)]
+        kind: String,
+
+        /// An optional file name where the backup is written. If omitted
+        /// the file will be named according to the object label.
+        #[clap(long, env)]
+        file: Option<PathBuf>,
+    },
+
     /// Display device info.
     Info,
 
@@ -99,8 +117,16 @@ enum HsmCommand {
     /// Reset to factory defaults
     Reset,
 
+    /// Restore a previously backed up key.
+    Restore {
+        /// An optional file name where the backup is written. If omitted
+        /// the file will be named according to the object label.
+        #[clap(long, env)]
+        file: PathBuf,
+    },
+
     /// Restore a previously split aes256-ccm-wrap key
-    Restore,
+    RestoreWrap,
 }
 
 // 2 minute to support RSA4K key generation
@@ -214,8 +240,22 @@ fn main() -> Result<()> {
                 HsmCommand::Generate { key_spec } => {
                     oks::hsm::generate(&client, &key_spec, &args.public)
                 }
+                HsmCommand::Backup { id, kind, file } => {
+                    // this is a bit weird but necessary because the Type type
+                    // returns () on error, not a type implementing std::Error
+                    let kind = match Type::from_str(&kind) {
+                        Ok(k) => k,
+                        Err(_) => {
+                            return Err(anyhow::anyhow!("Invalid object type."))
+                        }
+                    };
+                    oks::hsm::backup(&client, id, kind, file, &args.public)
+                }
                 HsmCommand::Reset => oks::hsm::reset(&client),
-                HsmCommand::Restore => oks::hsm::restore(&client),
+                HsmCommand::Restore { file } => {
+                    oks::hsm::restore(&client, file)
+                }
+                HsmCommand::RestoreWrap => oks::hsm::restore_wrap(&client),
             }
         }
     }
