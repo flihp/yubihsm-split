@@ -7,7 +7,7 @@ A utility and library for managing and interacting with the offline keystore.
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0.69"
+anyhow = "1.0.81"
 clap = { version = "4.1.6", features = ["derive", "env"] }
 env_logger = "0.10.0"
 fs_extra = "1.3.0"
