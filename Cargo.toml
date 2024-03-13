@@ -31,4 +31,4 @@ thiserror = "1.0.58"
 # to 1.64 till offline-keystore-os supports it
 vsss-rs = "2.7.1"
 yubihsm = { version = "0.41.0", features = ["usb"] }
-zeroize = "1.5.7"
+zeroize = "1.7.0"
