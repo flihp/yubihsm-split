@@ -43,6 +43,16 @@ pub enum ConfigError {
     BadCsrSpec { e: serde_json::Error },
 }
 
+// Conversion functions to / from String <-> Label
+serde_with::serde_conv!(
+    LabelAsString,
+    Label,
+    |label: &Label| label.to_string(),
+    |string: String| -> Result<Label, anyhow::Error> {
+        Ok(Label::from(string.as_str()))
+    }
+);
+
 // These structs duplicate data from the yubihsm crate
 // The Algorithm and Domain types serialize but won't deserialize
 #[derive(Copy, Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -192,30 +202,15 @@ impl TryFrom<OksKeySpec> for KeySpec {
     }
 }
 
-/// This struct / type is an intermediate state between the CsrSpec struct
-/// below and its JSON representation.
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
-struct OksCsrSpec {
-    pub label: OksLabel,
-    pub csr: Vec<String>,
-}
-
-impl From<&CsrSpec> for OksCsrSpec {
-    fn from(value: &CsrSpec) -> Self {
-        let label = OksLabel(value.label.to_string());
-        let csr: Vec<_> = value.csr.lines().map(str::to_string).collect();
-
-        Self { label, csr }
-    }
-}
-
 /// CSRs are great but we need to know which key / CA should be used to sign
 /// the cert. This is a small wrapper over a key label and a CSR. When sending
 /// a CSR to the OKS, populate this structure with the label for the key / CA
 /// you want to sign your cert and the PEM encoded CSR.
+#[serde_with::serde_as]
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct CsrSpec {
     /// The key / CA that should be used to sign the CSR.
+    #[serde_as(as = "LabelAsString")]
     pub label: Label,
     /// the CSR to be signed
     pub csr: String,
@@ -224,8 +219,7 @@ pub struct CsrSpec {
 impl CsrSpec {
     /// Return the JSON representation of CsrSpec
     pub fn json(&self) -> Result<String, serde_json::Error> {
-        let oks_csr_spec = OksCsrSpec::from(self);
-        serde_json::to_string_pretty(&oks_csr_spec)
+        serde_json::to_string_pretty(self)
     }
 }
 
@@ -233,20 +227,7 @@ impl FromStr for CsrSpec {
     type Err = ConfigError;
 
     fn from_str(data: &str) -> Result<Self, Self::Err> {
-        let spec: OksCsrSpec = serde_json::from_str(data)
-            .map_err(|e| ConfigError::BadCsrSpec { e })?;
-        spec.try_into()
-    }
-}
-
-impl TryFrom<OksCsrSpec> for CsrSpec {
-    type Error = ConfigError;
-
-    fn try_from(spec: OksCsrSpec) -> Result<Self, Self::Error> {
-        Ok(CsrSpec {
-            label: spec.label.try_into()?,
-            csr: spec.csr.join("\n"),
-        })
+        serde_json::from_str(data).map_err(|e| ConfigError::BadCsrSpec { e })
     }
 }
 
@@ -269,15 +250,6 @@ pub fn files_with_ext(dir: &Path, ext: &str) -> Result<Vec<PathBuf>> {
 
     Ok(paths)
 }
-
-serde_with::serde_conv!(
-    LabelAsString,
-    Label,
-    |label: &Label| label.to_string(),
-    |string: String| -> Result<Label, anyhow::Error> {
-        Ok(Label::from(string.as_str()))
-    }
-);
 
 #[serde_with::serde_as]
 #[derive(Debug, Deserialize, Serialize)]
@@ -416,28 +388,8 @@ mod tests {
     // valid CSR
     const JSON_CSR: &str = r#"{
         "label":"rot-identity-signing-ca",
-        "csr":[
-            "-----BEGIN CERTIFICATE REQUEST-----",
-            "OQ==",
-            "-----END CERTIFICATE REQUEST-----"
-        ]
+        "csr": "-----BEGIN CERTIFICATE REQUEST-----\nOQ==\n-----END CERTIFICATE REQUEST-----"
     }"#;
-
-    #[test]
-    fn test_oks_csr_deserialize() -> Result<()> {
-        let csr_spec: OksCsrSpec = serde_json::from_str(&JSON_CSR)?;
-        assert_eq!(csr_spec.label.0, "rot-identity-signing-ca");
-        assert_eq!(
-            csr_spec.csr.first().unwrap(),
-            "-----BEGIN CERTIFICATE REQUEST-----"
-        );
-        assert_eq!(
-            csr_spec.csr.last().unwrap(),
-            "-----END CERTIFICATE REQUEST-----"
-        );
-
-        Ok(())
-    }
 
     #[test]
     fn test_csr_deserialize() -> Result<()> {
@@ -454,9 +406,6 @@ mod tests {
 
     #[test]
     fn test_csr_spec_serialize() -> Result<()> {
-        // strategy: first convert to json, which is the operation under test,
-        // then deserialize that back into an OksCsrSpec and compare with one
-        // that we expect.
         let label = "psc-rot-stage0-code-signing-dev-a";
         let csr = "-----BEGIN CERTIFICATE REQUEST-----
 0000000000000000000000000000000000000000000000000000000000000000
@@ -467,23 +416,18 @@ mod tests {
 
         let csr_spec = CsrSpec {
             label: Label::from_str(label)?,
-            csr,
+            csr: csr.clone(),
         };
         let json = csr_spec.json()?;
 
-        let oks_csr_spec: OksCsrSpec = serde_json::from_str(&json)?;
+        let csr_spec: CsrSpec = serde_json::from_str(&json)?;
 
-        let expected = OksCsrSpec {
-            label: OksLabel(label.to_string()),
-            csr: vec![
-                "-----BEGIN CERTIFICATE REQUEST-----".to_string(),
-                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-                "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
-                "-----END CERTIFICATE REQUEST-----".to_string(),
-            ]
+        let expected = CsrSpec {
+            label: label.into(),
+            csr,
         };
 
-        assert_eq!(expected, oks_csr_spec);
+        assert_eq!(expected, csr_spec);
 
         Ok(())
     }
