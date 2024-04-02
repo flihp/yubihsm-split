@@ -492,6 +492,9 @@ pub fn sign(
                 }
                 return Err(e);
             }
+
+            let session = hsm.client.session()?;
+            session.close();
         } else {
             error!("Unknown input spec: {}", path.display());
         }
