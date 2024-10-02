@@ -5,10 +5,13 @@
 use anyhow::{Context, Result};
 use hex::ToHex;
 use log::{debug, error, info};
-use p256::elliptic_curve::PrimeField;
-use p256::{NonZeroScalar, ProjectivePoint, Scalar, SecretKey};
+use p256::{
+    elliptic_curve::{group::GroupEncoding, PrimeField},
+    ProjectivePoint, Scalar,
+};
 use pem_rfc7468::LineEnding;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+use serde::{Deserialize, Serialize};
 use static_assertions as sa;
 use std::collections::HashSet;
 use std::fs::File;
@@ -19,7 +22,7 @@ use std::{
     str::FromStr,
 };
 use thiserror::Error;
-use vsss_rs::{Feldman, Share};
+use vsss_rs::{feldman, FeldmanVerifierSet};
 use yubihsm::{
     authentication::{self, Key, DEFAULT_AUTHENTICATION_KEY_ID},
     object::{Id, Label, Type},
@@ -139,6 +142,29 @@ impl Alphabet {
     }
 }
 
+/// This is a container type to hold a serializable copy of the verifier produced by
+/// `vsss_rs::feldman::split_secret`.
+#[derive(Deserialize, Serialize)]
+pub struct Verifier {
+    generator: Vec<u8>,
+    commitments: Vec<Vec<u8>>,
+}
+
+impl From<Vec<ProjectivePoint>> for Verifier {
+    fn from(v: Vec<ProjectivePoint>) -> Self {
+        let mut commitments: Vec<Vec<u8>> = Vec::default();
+
+        for share in v {
+            commitments.push(share.to_bytes().to_vec());
+        }
+
+        Verifier {
+            generator: Vec::default(),
+            commitments,
+        }
+    }
+}
+
 /// Structure holding common data used by OKS when interacting with the HSM.
 pub struct Hsm {
     pub client: Client,
@@ -218,20 +244,31 @@ impl Hsm {
             })?;
         let mut rng = ChaCha20Rng::from_seed(rng_seed);
 
+        let wrap_key: [u8; KEY_LEN] =
+            wrap_key.try_into().map_err(|v: Vec<u8>| {
+                anyhow::anyhow!(
+                    "Expected vec with {} elements, got {}",
+                    KEY_LEN,
+                    v.len()
+                )
+            })?;
         info!("Splitting wrap key into {} shares.", SHARES);
-        let wrap_key = SecretKey::from_be_bytes(&wrap_key)?;
-        debug!("wrap key: {:?}", wrap_key.to_be_bytes());
+        // if we can wrap the yubihsm rng up in the RngCore we can
+        // use Scalar::random()
+        let wrap_key = Scalar::from_repr(wrap_key.into())
+            .into_option()
+            .ok_or_else(|| anyhow::anyhow!("invalid scalar"))?;
+        debug!("wrap key: {:?}", wrap_key.to_bytes());
 
-        let nzs = wrap_key.to_nonzero_scalar();
-        // we add a byte to the key length per instructions from the library:
-        // https://docs.rs/vsss-rs/2.7.1/src/vsss_rs/lib.rs.html#34
-        let (shares, verifier) = Feldman::<THRESHOLD, SHARES>::split_secret::<
-            Scalar,
-            ProjectivePoint,
-            ChaCha20Rng,
-            { KEY_LEN + 1 },
-        >(*nzs.as_ref(), None, &mut rng)
-        .map_err(|e| HsmError::SplitKeyFailed { e })?;
+        let (shares, verifier) =
+            feldman::split_secret::<ProjectivePoint, u8, Vec<u8>>(
+                3, 5, wrap_key, None, &mut rng,
+            )
+            .map_err(|e| HsmError::SplitKeyFailed { e })?;
+
+        for s in &shares {
+            assert!(verifier.verify_share(s).is_ok());
+        }
 
         let verifier_path = self.out_dir.join("verifier.json");
         debug!(
@@ -239,6 +276,9 @@ impl Hsm {
             verifier_path.display()
         );
 
+        // Transform the verifier produced by vsss_rs into something that
+        // serde can serialize.
+        let verifier: Verifier = verifier.into();
         let verifier = serde_json::to_string(&verifier)?;
         debug!("JSON: {}", verifier);
 
@@ -289,7 +329,7 @@ impl Hsm {
                 CAPS,
                 DELEGATED_CAPS,
                 ALG,
-                wrap_key.to_be_bytes().into(),
+                wrap_key.to_bytes().into(),
             )
             .with_context(|| {
                 format!(
@@ -423,7 +463,7 @@ impl Hsm {
     pub fn restore_wrap(&self) -> Result<()> {
         info!("Restoring HSM from backup");
         info!("Restoring backup / wrap key from shares");
-        let mut shares: Vec<[u8; KEY_LEN + 1]> = Vec::new();
+        let mut shares: Vec<Vec<u8>> = Vec::new();
 
         for i in 1..=THRESHOLD {
             print!("Enter share[{}]: ", i);
@@ -441,25 +481,10 @@ impl Hsm {
             debug!("share[{}]: {}", i, share.encode_hex::<String>());
         }
 
-        let shares: Vec<Share<{ KEY_LEN + 1 }>> = shares
-            .iter()
-            .map(|s| Share::try_from(&s[..]).unwrap())
-            .collect();
-        let scalar = Feldman::<THRESHOLD, SHARES>::combine_shares::<
-            Scalar,
-            { KEY_LEN + 1 },
-        >(&shares)
-        .map_err(|e| HsmError::CombineKeyFailed { e })?;
+        let scalar: Scalar = vsss_rs::combine_shares(&shares)
+            .map_err(|e| HsmError::CombineKeyFailed { e })?;
 
-        let nz_scalar = NonZeroScalar::from_repr(scalar.to_repr());
-        let nz_scalar = if nz_scalar.is_some().into() {
-            nz_scalar.unwrap()
-        } else {
-            return Err(HsmError::BadScalar.into());
-        };
-        let wrap_key = SecretKey::from(nz_scalar);
-
-        debug!("restored wrap key: {:?}", wrap_key.to_be_bytes());
+        debug!("restored wrap key: {:?}", scalar.to_bytes());
 
         // put restored wrap key the YubiHSM as an Aes256Ccm wrap key
         let id = self.client
@@ -470,7 +495,7 @@ impl Hsm {
                 CAPS,
                 DELEGATED_CAPS,
                 ALG,
-                wrap_key.to_be_bytes().into(),
+                scalar.to_bytes().into(),
             )
             .with_context(|| {
                 format!(
