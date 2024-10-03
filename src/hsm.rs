@@ -145,23 +145,40 @@ impl Alphabet {
 /// This is a container type to hold a serializable copy of the verifier produced by
 /// `vsss_rs::feldman::split_secret`.
 #[derive(Deserialize, Serialize)]
-pub struct Verifier {
+pub struct VerifierStr {
+    #[serde(with = "serde_bytes")]
     generator: Vec<u8>,
-    commitments: Vec<Vec<u8>>,
+    // can't figure out a clean way to turn this into Vec<Vec<u8>>
+    commitments: Vec<String>,
 }
 
-impl From<Vec<ProjectivePoint>> for Verifier {
+impl From<Vec<ProjectivePoint>> for VerifierStr {
     fn from(v: Vec<ProjectivePoint>) -> Self {
-        let mut commitments: Vec<Vec<u8>> = Vec::default();
+        let mut commitments: Vec<String> = Vec::default();
 
         for share in v {
-            commitments.push(share.to_bytes().to_vec());
+            commitments.push(String::from_utf8(share.to_bytes().to_vec()).unwrap());
         }
 
-        Verifier {
+        Self {
             generator: Vec::default(),
             commitments,
         }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct Verifier(Vec<Vec<u8>>);
+
+impl From<VerifierStr> for Verifier {
+    fn from(v: VerifierStr) -> Self {
+        let mut commitments: Vec<Vec<u8>> = Vec::default();
+
+        for commitment in v.commitments {
+            commitments.push(commitment.as_bytes().to_vec());
+        }
+
+        Verifier(commitments)
     }
 }
 
@@ -278,7 +295,8 @@ impl Hsm {
 
         // Transform the verifier produced by vsss_rs into something that
         // serde can serialize.
-        let verifier: Verifier = verifier.into();
+        let verifier: VerifierStr = verifier.into();
+        //let verifier: Verifier = verifier.into();
         let verifier = serde_json::to_string(&verifier)?;
         debug!("JSON: {}", verifier);
 
@@ -835,4 +853,19 @@ pub fn print_password(
 
     print_file.write_all(&[CR, FF])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VERIFIER: &str = "{\"generator\":\"036b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296\",\"commitments\":[\"02315e9e3cd76d0917ecd60378b75259bbdf2e35a31f46c05a497409d5d89c69dc\",\"0250e4e04d42e92bc15eecbe0789f5ac4831abe962df6b1eaed897e4634df702e3\",\"02dfc3c60074cb4896163e7e188f8ec93d3bd1e2fd2ed68854c9324e4a56e94cc7\"]}";
+
+    #[test]
+    fn deserialize_verifier() -> Result<()> {
+        let verifier: VerifierStr = serde_json::from_str(VERIFIER)?;
+        let _verifier: Verifier = verifier.into();
+
+        Ok(())
+    }
 }
