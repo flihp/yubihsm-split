@@ -387,6 +387,30 @@ fn main() -> Result<()> {
                 }
                 HsmCommand::Generate { key_spec } => hsm.generate(&key_spec),
                 HsmCommand::Restore => {
+                    // using default auth:
+                    // - reset device to factory defaults this *should* clear
+                    // the audit lock
+                    // NOTE: YubiCo isn't clear on which firmware version
+                    // first shipped with this feature enabled. In previous
+                    // versions the lock could not be cleared
+                    // - audit lock
+                    // NOTE: this is the most likely step to fail
+                    // - restore backup key from shares
+                    // - restore auth key from backup
+                    // using restored auth: (HSM custodian provides password)
+                    // - delete default auth
+                    // - restore keys (except for admin.backup.json)
+                    // - get an attestation for each restored key and write
+                    // to output
+                    // - compare public key from new attestation w/ one from
+                    // old attestation
+                    // NOTE: We've already got a pretty good signal that the
+                    // recovery has been successful since the HSM custodian
+                    // was able to authenticate. This check can probably be
+                    // done in post-processing.
+                    // - dump audit log to output
+                    // NOTE: We may need to dump the log before we get to the
+                    // final step. Check in testing.
                     hsm.restore_wrap()?;
                     oks::hsm::restore(&hsm.client, &hsm.state_dir)?;
                     info!("Deleting default authentication key");
