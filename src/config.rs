@@ -27,6 +27,7 @@ pub const ENV_PASSWORD: &str = "OKS_PASSWORD";
 // password for the HSM
 pub const ENV_NEW_PASSWORD: &str = "OKS_NEW_PASSWORD";
 
+pub const BACKUP_EXT: &str = ".backup.json";
 pub const KEYSPEC_EXT: &str = ".keyspec.json";
 
 #[derive(Error, Debug)]

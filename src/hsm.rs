@@ -15,7 +15,7 @@ use std::fs::File;
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
     str::FromStr,
 };
 use thiserror::Error;
@@ -29,7 +29,10 @@ use yubihsm::{
 };
 use zeroize::Zeroizing;
 
-use crate::config::{self, KeySpec, Transport, KEYSPEC_EXT};
+use crate::{
+    config::{self, KeySpec, Transport, BACKUP_EXT, KEYSPEC_EXT},
+    storage::{Storage, VERIFIER_FILE_NAME},
+};
 
 const WRAP_ID: Id = 1;
 
@@ -42,14 +45,12 @@ const SEED_LEN: usize = 32;
 const KEY_LEN: usize = 32;
 const SHARE_LEN: usize = KEY_LEN + 1;
 const LABEL: &str = "backup";
-const VERIFIER_FILE: &str = "verifier.json";
 
 const SHARES: usize = 5;
 const THRESHOLD: usize = 3;
 sa::const_assert!(THRESHOLD <= SHARES);
 
-const BACKUP_EXT: &str = ".backup.json";
-const ATTEST_FILE_NAME: &str = "hsm.attest.cert.pem";
+const ATTEST_EXT: &str = ".attest.cert.pem";
 
 #[derive(Error, Debug)]
 pub enum HsmError {
@@ -145,8 +146,7 @@ impl Alphabet {
 /// Structure holding common data used by OKS when interacting with the HSM.
 pub struct Hsm {
     pub client: Client,
-    pub out_dir: PathBuf,
-    pub state_dir: PathBuf,
+    pub storage: Storage,
     pub alphabet: Alphabet,
     pub backup: bool,
 }
@@ -161,8 +161,7 @@ impl Hsm {
     pub fn new(
         auth_id: Id,
         passwd: &str,
-        out_dir: &Path,
-        state_dir: &Path,
+        storage: Storage,
         backup: bool,
         transport: Transport,
     ) -> Result<Self> {
@@ -186,8 +185,7 @@ impl Hsm {
 
         Ok(Hsm {
             client,
-            out_dir: out_dir.to_path_buf(),
-            state_dir: state_dir.to_path_buf(),
+            storage,
             alphabet: Alphabet::new(),
             backup,
         })
@@ -236,16 +234,10 @@ impl Hsm {
         >(*nzs.as_ref(), None, &mut rng)
         .map_err(|e| HsmError::SplitKeyFailed { e })?;
 
-        let verifier_path = self.out_dir.join(VERIFIER_FILE);
-        debug!(
-            "Serializing verifier as json to: {}",
-            verifier_path.display()
-        );
-
         let verifier = serde_json::to_string(&verifier)?;
         debug!("JSON: {}", verifier);
-
-        fs::write(verifier_path, verifier)?;
+        self.storage
+            .write_to_output(VERIFIER_FILE_NAME, verifier.as_bytes())?;
 
         println!(
             "\nWARNING: The wrap / backup key has been created and stored in the\n\
@@ -335,12 +327,7 @@ impl Hsm {
 
         if self.backup {
             info!("Backing up new auth credential.");
-            backup_object(
-                &self.client,
-                AUTH_ID,
-                Type::AuthenticationKey,
-                &self.state_dir,
-            )?;
+            self.backup_object(AUTH_ID, Type::AuthenticationKey)?;
         }
 
         info!("Deleting default auth key.");
@@ -350,6 +337,22 @@ impl Hsm {
         )?;
 
         Ok(())
+    }
+
+    pub fn backup_object(&self, id: Id, kind: Type) -> Result<()> {
+        info!("Backing up object with id: {:#06x} and type: {}", id, kind);
+        let info = self.client.get_object_info(id, kind)?;
+        info!("Backing up object with label: {}", info.label);
+        let message = self.client.export_wrapped(WRAP_ID, kind, id)?;
+        debug!("Got Message: {:?}", &message);
+
+        let json = serde_json::to_string(&message)?;
+        debug!("JSON: {}", json);
+
+        let path = format!("{}.backup.json", info.label);
+        info!("Writing backup to: \"{}\"", path);
+
+        self.storage.write_to_output(&path, json.as_bytes())
     }
 
     pub fn generate(&self, key_spec: &Path) -> Result<()> {
@@ -379,12 +382,7 @@ impl Hsm {
             info!("Generating key for spec: {:?}", path);
             let id = self.generate_keyspec(&spec)?;
             if self.backup {
-                backup_object(
-                    &self.client,
-                    id,
-                    Type::AsymmetricKey,
-                    &self.state_dir,
-                )?;
+                self.backup_object(id, Type::AsymmetricKey)?;
             }
         }
 
@@ -413,9 +411,10 @@ impl Hsm {
             attest_cert.as_slice(),
         )?;
 
-        let attest_path =
-            self.out_dir.join(format!("{}.attest.cert.pem", spec.label));
-        fs::write(attest_path, attest_cert)?;
+        self.storage.write_to_output(
+            &format!("{}.attest.cert.pem", spec.label),
+            attest_cert.as_bytes(),
+        )?;
 
         Ok(id)
     }
@@ -423,16 +422,18 @@ impl Hsm {
     /// This function prompts the user to enter M of the N backup shares. It
     /// uses these shares to reconstitute the wrap key. This wrap key can then
     /// be used to restore previously backed up / export wrapped keys.
-    pub fn restore_wrap(&self) -> Result<()> {
+    pub fn restore_wrap<P: AsRef<Path>>(&self, verifier: P) -> Result<()> {
         info!("Restoring HSM from backup");
-        info!("Restoring backup / wrap key from shares");
+        info!(
+            "Restoring backup / wrap key from shares with verifier: {}",
+            verifier.as_ref().display()
+        );
         // vector used to collect shares
         let mut shares: Vec<Share<SHARE_LEN>> = Vec::new();
 
         // deserialize verifier:
         // verifier was serialized to output/verifier.json in the provisioning ceremony
         // it must be included in and deserialized from the ceremony inputs
-        let verifier = self.out_dir.join(VERIFIER_FILE);
         let verifier = fs::read_to_string(verifier)?;
         let verifier: FeldmanVerifier<Scalar, ProjectivePoint, SHARE_LEN> =
             serde_json::from_str(&verifier)?;
@@ -526,7 +527,14 @@ impl Hsm {
                     let _ = io::stdin().read(&mut [0u8]).unwrap();
                     break;
                 } else {
-                    println!("Failed to verify share: try again");
+                    print!(
+                        "\nFailed to verify share :(\n\nPress any key to \
+                        try again ..."
+                    );
+                    io::stdout().flush()?;
+
+                    // wait for a keypress / 1 byte from stdin
+                    let _ = io::stdin().read(&mut [0u8]).unwrap();
                     continue;
                 }
             }
@@ -572,14 +580,43 @@ impl Hsm {
         Ok(())
     }
 
+    pub fn restore_all<P: AsRef<Path>>(&self, backups: P) -> Result<()> {
+        let backups = backups.as_ref();
+        info!("Restoring from backups: \"{}\"", &backups.display());
+
+        let backups = if backups.is_file() {
+            vec![backups.to_path_buf()]
+        } else {
+            config::files_with_ext(backups, BACKUP_EXT)?
+        };
+
+        if backups.is_empty() {
+            return Err(anyhow::anyhow!("no backups in provided directory"));
+        }
+
+        for backup in backups {
+            info!("Restoring wrapped backup from file: {}", backup.display());
+            let json = fs::read_to_string(backup)?;
+
+            debug!("backup json: {}", json);
+            let message: Message = serde_json::from_str(&json)?;
+
+            debug!("deserialized message: {:?}", &message);
+            let handle = self.client.import_wrapped(WRAP_ID, message)?;
+
+            info!(
+                "Imported {} key with object id {}.",
+                handle.object_type, handle.object_id
+            );
+        }
+        Ok(())
+    }
+
     /// Write the cert for default attesation key in hsm to the provided
     /// filepath or a default location under self.output
-    pub fn dump_attest_cert<P: AsRef<Path>>(
-        &self,
-        out: Option<P>,
-    ) -> Result<()> {
-        info!("Collecting YubiHSM attestation cert.");
-        debug!("extracting attestation certificate");
+    pub fn collect_attest_cert(&self) -> Result<()> {
+        let sn = self.client.device_info()?.serial_number;
+        info!("Collecting attestation cert for YubiHSM w/ SN: {}", sn);
         let attest_cert = self.client.get_opaque(0)?;
 
         let attest_cert = pem_rfc7468::encode_string(
@@ -588,90 +625,17 @@ impl Hsm {
             &attest_cert,
         )?;
 
-        let attest_path = match out {
-            Some(o) => {
-                if o.as_ref().is_dir() {
-                    o.as_ref().join(ATTEST_FILE_NAME)
-                } else if o.as_ref().exists() {
-                    // file exists ... overwrite it?
-                    return Err(anyhow::anyhow!("File already exists."));
-                } else {
-                    o.as_ref().to_path_buf()
-                }
-            }
-            None => self.out_dir.join(ATTEST_FILE_NAME),
-        };
+        let attest_path = format!("{}.{}", sn, ATTEST_EXT);
+        debug!("writing attestation cert to: {}", attest_path);
 
-        debug!("writing attestation cert to: {}", attest_path.display());
-        Ok(fs::write(&attest_path, attest_cert)?)
+        self.storage
+            .write_to_output(&attest_path, attest_cert.as_bytes())
     }
-}
-
-/// Provided a key ID and a object type this function will find the object
-/// in the HSM and generate the appropriate KeySpec for it.
-pub fn backup_object<P: AsRef<Path>>(
-    client: &Client,
-    id: Id,
-    kind: Type,
-    file: P,
-) -> Result<()> {
-    info!("Backing up object with id: {:#06x} and type: {}", id, kind);
-    let message = client.export_wrapped(WRAP_ID, kind, id)?;
-    debug!("Got Message: {:?}", &message);
-
-    let json = serde_json::to_string(&message)?;
-    debug!("JSON: {}", json);
-
-    let path = if file.as_ref().is_dir() {
-        // get info
-        // append format!("{}.backup.json", info.label)
-        let info = client.get_object_info(id, kind)?;
-        file.as_ref().join(format!("{}.backup.json", info.label))
-    } else if file.as_ref().exists() {
-        // file exists ... overwrite it?
-        return Err(anyhow::anyhow!("File already exists."));
-    } else {
-        file.as_ref().to_path_buf()
-    };
-
-    info!("Writing backup to: \"{}\"", path.display());
-    Ok(fs::write(path, json)?)
 }
 
 pub fn delete(client: &Client, id: Id, kind: Type) -> Result<()> {
     info!("Deleting object with id: {} type: {}", &id, &kind);
     Ok(client.delete_object(id, kind)?)
-}
-
-pub fn restore<P: AsRef<Path>>(client: &Client, file: P) -> Result<()> {
-    let file = file.as_ref();
-    info!("Restoring from backups in: \"{}\"", &file.display());
-    let paths = if file.is_file() {
-        vec![file.to_path_buf()]
-    } else {
-        config::files_with_ext(file, BACKUP_EXT)?
-    };
-
-    if paths.is_empty() {
-        return Err(anyhow::anyhow!("backup directory is empty"));
-    }
-
-    for path in paths {
-        info!("Restoring wrapped backup from file: {}", path.display());
-        let json = fs::read_to_string(path)?;
-        debug!("backup json: {}", json);
-
-        let message: Message = serde_json::from_str(&json)?;
-        debug!("deserialized message: {:?}", &message);
-
-        let handle = client.import_wrapped(WRAP_ID, message)?;
-        info!(
-            "Imported {} key with object id {}.",
-            handle.object_type, handle.object_id
-        );
-    }
-
-    Ok(())
 }
 
 pub fn dump_info(client: &Client) -> Result<()> {

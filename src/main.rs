@@ -7,14 +7,20 @@ use clap::{Parser, Subcommand};
 use env_logger::Builder;
 use log::{debug, error, info, LevelFilter};
 use std::{
-    env, fs,
+    env,
     path::{Path, PathBuf},
 };
 use yubihsm::object::{Id, Type};
 use zeroize::Zeroizing;
 
-use oks::config::{Transport, ENV_NEW_PASSWORD, ENV_PASSWORD};
-use oks::hsm::{self, Hsm};
+use oks::{
+    config::{Transport, ENV_NEW_PASSWORD, ENV_PASSWORD},
+    hsm::{self, Hsm},
+    storage::{
+        Storage, DEFAULT_INPUT, DEFAULT_OUTPUT, DEFAULT_STATE, DEFAULT_VERIFIER,
+    },
+    util,
+};
 
 const PASSWD_PROMPT: &str = "Enter new password: ";
 const PASSWD_PROMPT2: &str = "Enter password again to confirm: ";
@@ -30,11 +36,11 @@ struct Args {
     verbose: bool,
 
     /// Directory where we put certs and attestations
-    #[clap(long, env, default_value = "output")]
+    #[clap(long, env, default_value = DEFAULT_OUTPUT)]
     output: PathBuf,
 
     /// Directory where we put KeySpec, CA state and backups
-    #[clap(long, env, default_value = "ca-state")]
+    #[clap(long, env, default_value = DEFAULT_STATE)]
     state: PathBuf,
 
     /// 'usb' or 'http'
@@ -68,10 +74,10 @@ enum Command {
     /// is equivalent to executing `hsm initialize`, `hsm generate`,
     /// `ca initialize`, and `ca sign`.
     Ceremony {
-        #[clap(long, env, default_value = "input")]
+        #[clap(long, env, default_value = DEFAULT_INPUT)]
         csr_spec: PathBuf,
 
-        #[clap(long, env, default_value = "input")]
+        #[clap(long, env, default_value = DEFAULT_INPUT)]
         key_spec: PathBuf,
 
         /// Path to the YubiHSM PKCS#11 module
@@ -98,7 +104,7 @@ enum CaCommand {
     /// Initialize an OpenSSL CA for the given key.
     Initialize {
         /// Spec file describing the CA signing key
-        #[clap(long, env, default_value = "input")]
+        #[clap(long, env, default_value = DEFAULT_INPUT)]
         key_spec: PathBuf,
 
         /// Path to the YubiHSM PKCS#11 module
@@ -113,7 +119,7 @@ enum CaCommand {
     /// Use the CA associated with the provided key spec to sign the
     /// provided CSR.
     Sign {
-        #[clap(long, env, default_value = "input")]
+        #[clap(long, env, default_value = DEFAULT_INPUT)]
         csr_spec: PathBuf,
     },
 }
@@ -130,7 +136,7 @@ enum CaCommand {
 enum HsmCommand {
     /// Generate keys in YubiHSM from specification.
     Generate {
-        #[clap(long, env, default_value = "input")]
+        #[clap(long, env, default_value = DEFAULT_INPUT)]
         key_spec: PathBuf,
     },
 
@@ -146,28 +152,16 @@ enum HsmCommand {
     },
 
     /// Restore a previously split aes256-ccm-wrap key
-    Restore,
+    Restore {
+        #[clap(long, env, default_value = DEFAULT_INPUT)]
+        backups: PathBuf,
+
+        #[clap(long, env, default_value = DEFAULT_VERIFIER)]
+        verifier: PathBuf,
+    },
 
     /// Get serial number from YubiHSM and dump to console.
     SerialNumber,
-}
-
-fn make_dir(path: &Path) -> Result<()> {
-    if !path.try_exists()? {
-        // output directory doesn't exist, create it
-        info!(
-            "required directory does not exist, creating: \"{}\"",
-            path.display()
-        );
-        Ok(fs::create_dir_all(path)?)
-    } else if !path.is_dir() {
-        Err(anyhow::anyhow!(
-            "directory provided is not a directory: \"{}\"",
-            path.display()
-        ))
-    } else {
-        Ok(())
-    }
 }
 
 /// Get auth_id, pick reasonable defaults if not set.
@@ -183,7 +177,10 @@ fn get_auth_id(auth_id: Option<Id>, command: &HsmCommand) -> Id {
                 print_dev: _,
                 passwd_challenge: _,
             }
-            | HsmCommand::Restore
+            | HsmCommand::Restore {
+                backups: _,
+                verifier: _,
+            }
             | HsmCommand::SerialNumber => 1,
             // otherwise we assume the auth key that we create is
             // present: auth_id 2
@@ -212,7 +209,10 @@ fn get_passwd(auth_id: Option<Id>, command: &HsmCommand) -> Result<String> {
                         print_dev: _,
                         passwd_challenge: _,
                     }
-                    | HsmCommand::Restore
+                    | HsmCommand::Restore {
+                        backups: _,
+                        verifier: _,
+                    }
                     | HsmCommand::SerialNumber => Ok("password".to_string()),
                     // otherwise prompt the user for the password
                     _ => Ok(rpassword::prompt_password(
@@ -269,18 +269,12 @@ fn do_ceremony(
     let passwd_new = {
         // assume YubiHSM is in default state: use default auth credentials
         let passwd = "password".to_string();
-        let hsm = Hsm::new(
-            1,
-            &passwd,
-            &args.output,
-            &args.state,
-            true,
-            args.transport,
-        )?;
+        let storage = Storage::new(Some(&args.state), Some(&args.output));
+        let hsm = Hsm::new(1, &passwd, storage, true, args.transport)?;
 
         hsm.new_split_wrap(print_dev)?;
         info!("Collecting YubiHSM attestation cert.");
-        hsm.dump_attest_cert::<String>(None)?;
+        hsm.collect_attest_cert()?;
 
         let passwd = if challenge {
             get_new_passwd(None)?
@@ -294,14 +288,8 @@ fn do_ceremony(
     };
     {
         // use new password to auth
-        let hsm = Hsm::new(
-            2,
-            &passwd_new,
-            &args.output,
-            &args.state,
-            true,
-            args.transport,
-        )?;
+        let storage = Storage::new(Some(&args.state), Some(&args.output));
+        let hsm = Hsm::new(2, &passwd_new, storage, true, args.transport)?;
         hsm.generate(key_spec)?;
     }
     // set env var for oks::ca module to pickup for PKCS11 auth
@@ -328,8 +316,8 @@ fn main() -> Result<()> {
     };
     builder.filter(None, level).init();
 
-    make_dir(&args.output)?;
-    make_dir(&args.state)?;
+    util::make_dir(&args.output)?;
+    util::make_dir(&args.state)?;
 
     match args.command {
         Command::Ca { command } => match command {
@@ -357,11 +345,11 @@ fn main() -> Result<()> {
         } => {
             let passwd = get_passwd(auth_id, &command)?;
             let auth_id = get_auth_id(auth_id, &command);
+            let storage = Storage::new(Some(&args.state), Some(&args.output));
             let hsm = Hsm::new(
                 auth_id,
                 &passwd,
-                &args.output,
-                &args.state,
+                storage,
                 !no_backup,
                 args.transport,
             )?;
@@ -382,13 +370,13 @@ fn main() -> Result<()> {
                         hsm::print_password(&print_dev, &passwd)?;
                         passwd
                     };
-                    hsm.dump_attest_cert::<String>(None)?;
+                    hsm.collect_attest_cert()?;
                     hsm.replace_default_auth(&passwd_new)
                 }
                 HsmCommand::Generate { key_spec } => hsm.generate(&key_spec),
-                HsmCommand::Restore => {
-                    hsm.restore_wrap()?;
-                    oks::hsm::restore(&hsm.client, &hsm.state_dir)?;
+                HsmCommand::Restore { backups, verifier } => {
+                    hsm.restore_wrap(verifier)?;
+                    hsm.restore_all(backups)?;
                     info!("Deleting default authentication key");
                     oks::hsm::delete(&hsm.client, 1, Type::AuthenticationKey)
                 }

@@ -12,6 +12,8 @@ use yubihsm::{
     AuditOption, Client, Connector, Credentials, UsbConfig,
 };
 
+use oks::util;
+
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 /// Create and restore split yubihsm wrap keys
@@ -173,7 +175,7 @@ fn main() -> Result<()> {
                 Ok(k) => k,
                 Err(_) => return Err(anyhow::anyhow!("Invalid object type.")),
             };
-            oks::hsm::backup_object(&client, id, kind, file)
+            util::backup_object(&client, id, kind, file)
         }
         Command::Delete { id, kind } => {
             // this is a bit weird but necessary because the Type type
@@ -186,6 +188,6 @@ fn main() -> Result<()> {
         }
         Command::Info => oks::hsm::dump_info(&client),
         Command::Reset => oks::hsm::reset(&client),
-        Command::Restore { file } => oks::hsm::restore(&client, file),
+        Command::Restore { file } => util::restore(&client, file),
     }
 }

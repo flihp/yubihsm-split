@@ -27,6 +27,7 @@ use crate::{
         KEYSPEC_EXT,
     },
     hsm::Hsm,
+    storage::Storage,
 };
 
 /// Name of file in root of a CA directory with key spec used to generate key
@@ -474,11 +475,14 @@ pub fn sign(
                 return Err(e);
             }
         } else if filename.ends_with(DCSRSPEC_EXT) {
+            let storage = Storage::new(
+                Some(state.to_str().unwrap()),
+                Some(publish.to_str().unwrap()),
+            );
             let mut hsm = Hsm::new(
                 0x0002,
                 &passwd_from_env("OKM_HSM_PKCS11_AUTH")?,
-                publish,
-                state,
+                storage,
                 false,
                 transport,
             )?;
