@@ -16,10 +16,7 @@ use zeroize::Zeroizing;
 use oks::{
     config::{Transport, ENV_NEW_PASSWORD, ENV_PASSWORD},
     hsm::{self, Hsm},
-    storage::{
-        Storage, DEFAULT_INPUT, DEFAULT_OUTPUT, DEFAULT_STATE, DEFAULT_VERIFIER,
-    },
-    util,
+    storage::{Storage, DEFAULT_INPUT, DEFAULT_STATE, DEFAULT_VERIFIER},
 };
 
 const PASSWD_PROMPT: &str = "Enter new password: ";
@@ -34,10 +31,6 @@ struct Args {
     /// Increase verbosity
     #[clap(long, env)]
     verbose: bool,
-
-    /// Directory where we put certs and attestations
-    #[clap(long, env, default_value = DEFAULT_OUTPUT)]
-    output: PathBuf,
 
     /// Directory where we put KeySpec, CA state and backups
     #[clap(long, env, default_value = DEFAULT_STATE)]
@@ -265,12 +258,11 @@ fn do_ceremony(
     challenge: bool,
     args: &Args,
 ) -> Result<()> {
-    // this is mut so we can zeroize when we're done
+    let storage = Storage::new(Some(&args.state));
     let passwd_new = {
         // assume YubiHSM is in default state: use default auth credentials
         let passwd = "password".to_string();
-        let storage = Storage::new(Some(&args.state), Some(&args.output));
-        let hsm = Hsm::new(1, &passwd, storage, true, args.transport)?;
+        let hsm = Hsm::new(1, &passwd, storage.clone(), true, args.transport)?;
 
         hsm.new_split_wrap(print_dev)?;
         info!("Collecting YubiHSM attestation cert.");
@@ -288,8 +280,8 @@ fn do_ceremony(
     };
     {
         // use new password to auth
-        let storage = Storage::new(Some(&args.state), Some(&args.output));
-        let hsm = Hsm::new(2, &passwd_new, storage, true, args.transport)?;
+        let hsm =
+            Hsm::new(2, &passwd_new, storage.clone(), true, args.transport)?;
         hsm.generate(key_spec)?;
     }
     // set env var for oks::ca module to pickup for PKCS11 auth
@@ -297,11 +289,16 @@ fn do_ceremony(
     oks::ca::initialize(
         key_spec,
         pkcs11_path,
-        &args.state,
-        &args.output,
+        &storage.get_ca_root()?,
+        &storage.get_output()?,
         args.transport,
     )?;
-    oks::ca::sign(csr_spec, &args.state, &args.output, args.transport)
+    oks::ca::sign(
+        csr_spec,
+        &storage.get_ca_root()?,
+        &storage.get_output()?,
+        args.transport,
+    )
 }
 
 fn main() -> Result<()> {
@@ -316,8 +313,7 @@ fn main() -> Result<()> {
     };
     builder.filter(None, level).init();
 
-    util::make_dir(&args.output)?;
-    util::make_dir(&args.state)?;
+    let storage = Storage::new(Some(&args.state));
 
     match args.command {
         Command::Ca { command } => match command {
@@ -327,14 +323,14 @@ fn main() -> Result<()> {
             } => oks::ca::initialize(
                 &key_spec,
                 &pkcs11_path,
-                &args.state,
-                &args.output,
+                &storage.get_ca_root()?,
+                &storage.get_output()?,
                 args.transport,
             ),
             CaCommand::Sign { csr_spec } => oks::ca::sign(
                 &csr_spec,
-                &args.state,
-                &args.output,
+                &storage.get_ca_root()?,
+                &storage.get_output()?,
                 args.transport,
             ),
         },
@@ -345,11 +341,10 @@ fn main() -> Result<()> {
         } => {
             let passwd = get_passwd(auth_id, &command)?;
             let auth_id = get_auth_id(auth_id, &command);
-            let storage = Storage::new(Some(&args.state), Some(&args.output));
             let hsm = Hsm::new(
                 auth_id,
                 &passwd,
-                storage,
+                storage.clone(),
                 !no_backup,
                 args.transport,
             )?;
