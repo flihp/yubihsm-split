@@ -411,8 +411,8 @@ impl Hsm {
             serde_json::from_str(&verifier)?;
 
         // get enough shares to recover backup key
-        let mut shares: Vec<Share> = Vec::new();
-        let share_getter =
+        let mut shares: Zeroizing<Vec<Share>> = Zeroizing::new(Vec::new());
+        let mut share_getter =
             ShareGetter::new(share_method, Some(share_device), verifier)?;
         for _ in 1..=THRESHOLD {
             let share = match share_getter.get_share()? {
