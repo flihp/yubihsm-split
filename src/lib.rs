@@ -5,3 +5,4 @@
 pub mod ca;
 pub mod config;
 pub mod hsm;
+pub mod shares;

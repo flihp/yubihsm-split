@@ -13,8 +13,11 @@ use std::{
 use yubihsm::object::{Id, Type};
 use zeroize::Zeroizing;
 
-use oks::config::{Transport, ENV_NEW_PASSWORD, ENV_PASSWORD};
-use oks::hsm::{self, Hsm};
+use oks::{
+    config::{Transport, ENV_NEW_PASSWORD, ENV_PASSWORD},
+    hsm::{self, Hsm},
+    shares::ShareMethod,
+};
 
 const PASSWD_PROMPT: &str = "Enter new password: ";
 const PASSWD_PROMPT2: &str = "Enter password again to confirm: ";
@@ -146,7 +149,25 @@ enum HsmCommand {
     },
 
     /// Restore a previously split aes256-ccm-wrap key
-    Restore,
+    Restore {
+        #[clap(long, env, default_value = "input")]
+        backups: PathBuf,
+
+        #[clap(long, env, default_value = "input/verifier.json")]
+        verifier: PathBuf,
+
+        #[clap(long, env)]
+        /// Method used to collect shares of backup key
+        share_method: Option<ShareMethod>,
+
+        #[clap(long, env)]
+        /// Path to device used to collect keyshares. If `--share-method` is
+        /// `cdrom` then this is the path to the CD device. If
+        /// `--share-method` is `iso` then `share-device` is the path to the
+        /// directory where the share isos are stored. The names of these
+        /// files must be the same as when created by oks.
+        share_device: Option<PathBuf>,
+    },
 
     /// Get serial number from YubiHSM and dump to console.
     SerialNumber,
@@ -183,7 +204,7 @@ fn get_auth_id(auth_id: Option<Id>, command: &HsmCommand) -> Id {
                 print_dev: _,
                 passwd_challenge: _,
             }
-            | HsmCommand::Restore
+            | HsmCommand::Restore { .. }
             | HsmCommand::SerialNumber => 1,
             // otherwise we assume the auth key that we create is
             // present: auth_id 2
@@ -212,7 +233,7 @@ fn get_passwd(auth_id: Option<Id>, command: &HsmCommand) -> Result<String> {
                         print_dev: _,
                         passwd_challenge: _,
                     }
-                    | HsmCommand::Restore
+                    | HsmCommand::Restore { .. }
                     | HsmCommand::SerialNumber => Ok("password".to_string()),
                     // otherwise prompt the user for the password
                     _ => Ok(rpassword::prompt_password(
@@ -386,9 +407,18 @@ fn main() -> Result<()> {
                     hsm.replace_default_auth(&passwd_new)
                 }
                 HsmCommand::Generate { key_spec } => hsm.generate(&key_spec),
-                HsmCommand::Restore => {
-                    hsm.restore_wrap()?;
-                    oks::hsm::restore(&hsm.client, &hsm.state_dir)?;
+                HsmCommand::Restore {
+                    backups,
+                    verifier,
+                    share_method,
+                    share_device,
+                } => {
+                    let share_method =
+                        share_method.unwrap_or_else(ShareMethod::default);
+                    let share_device =
+                        share_device.unwrap_or_else(|| "/dev/cdrom".into());
+                    hsm.restore_wrap(verifier, share_method, share_device)?;
+                    hsm.restore_all(backups)?;
                     info!("Deleting default authentication key");
                     oks::hsm::delete(&hsm.client, 1, Type::AuthenticationKey)
                 }
