@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use fs_extra::dir::CopyOptions;
 use log::{debug, error, info, warn};
 use std::{
+    convert::TryFrom,
     env,
     fs::{self, OpenOptions, Permissions},
     io,
@@ -53,6 +54,55 @@ pub enum CaError {
     CertGenFail,
     #[error("failed to create self signed cert for key")]
     SelfCertGenFail,
+}
+
+// TODO: address open questions:
+// - when do we set the password (env)?
+// - when do we start the connector?
+struct Ca {
+    root: PathBuf,
+}
+
+// TryFrom is how we create a Ca from an existing directory path.
+impl TryFrom<P: AsRef<Path>> for Ca {
+    type Error = CaError;
+
+    // TODO: sanity checks:
+    // - is `root` a directory / does it exist
+    // - are the files in `root` in the right place
+    // - are the files complete / correct
+    // minimum bar is directory & openssl.cnf existence
+    /// Create a Ca instance from a directory
+    /// This directory must be the root of a previously initialized Ca
+    fn from(root: P) -> Result<Self> {
+        Ok(Self {
+            root: PathBuf::from(root.as_ref()),
+        })
+    }
+}
+impl Ca {
+    // The path should not exist and we create everyting from the
+    // provided keyspec.
+    fn initialize<P: AsRef<Path>>(
+        spec: KeySpec,
+        root: P,
+        pkcs11_lib: P,
+        // storage / output type?
+    ) -> Result<Self> {
+        // initialize CA from keyspec: this does not create the key in the
+        // YubiHSM ... we could check (PITA) but currently we do not
+        // that would require Hsm::generate(keyspec)
+        //
+        // create directory for openssl ca from label in keyspec
+        // call graph we're trying to repro:
+        // initialize
+        // initialize_keyspec
+        // bootstrap_ca
+        todo!("Ca::initialize");
+    }
+
+    fn sign<P: AsRef<Path>>(&self, spec: P) {
+    }
 }
 
 // NOTE: before using the pkcs11 engine the connector must be running:
