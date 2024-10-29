@@ -7,14 +7,19 @@ use clap::{Parser, Subcommand};
 use env_logger::Builder;
 use log::{debug, error, info, LevelFilter};
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 use yubihsm::object::{Id, Type};
 use zeroize::Zeroizing;
 
-use oks::config::{Transport, ENV_NEW_PASSWORD, ENV_PASSWORD};
-use oks::hsm::{self, Hsm};
+use oks::{
+    config::{self, KeySpec, Transport, ENV_NEW_PASSWORD, ENV_PASSWORD, KEYSPEC_EXT},
+    ca::Ca,
+    hsm::{self, Hsm},
+};
 
 const PASSWD_PROMPT: &str = "Enter new password: ";
 const PASSWD_PROMPT2: &str = "Enter password again to confirm: ";
@@ -306,14 +311,136 @@ fn do_ceremony(
     }
     // set env var for oks::ca module to pickup for PKCS11 auth
     env::set_var(ENV_PASSWORD, &passwd_new);
-    oks::ca::initialize(
+    // for each key_spec in `key_spec` initialize Ca
+    let _ = initialize_cas(
         key_spec,
         pkcs11_path,
         &args.state,
         &args.output,
-        args.transport,
     )?;
-    oks::ca::sign(csr_spec, &args.state, &args.output, args.transport)
+    Ok(())
+//    oks::ca::sign(csr_spec, &args.state, &args.output, args.transport)
+}
+
+//fn sign_all(cas: HashMap<Label, Ca>,
+
+pub fn initialize_all_ca(
+    key_spec: &Path,
+    pkcs11_path: &Path,
+    ca_state: &Path,
+    out: &Path,
+) -> Result<HashMap<String, Ca>> {
+    let key_spec = fs::canonicalize(key_spec)?;
+    debug!("canonical KeySpec path: {}", key_spec.display());
+
+    let paths = if key_spec.is_file() {
+        vec![key_spec.clone()]
+    } else {
+        config::files_with_ext(&key_spec, KEYSPEC_EXT)?
+    };
+
+    if paths.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no files with extension \"{}\" found in dir: {}",
+            KEYSPEC_EXT,
+            &key_spec.display()
+        ));
+    }
+
+    let mut map = HashMap::new();
+    for key_spec in paths {
+        let spec = fs::canonicalize(key_spec)?;
+        debug!("canonical KeySpec path: {}", spec.display());
+
+        if !spec.is_file() {
+            return Err(anyhow::anyhow!("path to KeySpec isn't a file"));
+        }
+
+        let spec_json = fs::read_to_string(spec)?;
+        let spec = KeySpec::from_str(&spec_json)?;
+
+        let ca = Ca::initialize(spec, ca_state, pkcs11_path, out)?;
+        if map.insert(ca.name(), ca).is_some() {
+            return Err(anyhow::anyhow!("duplicate key label").into());
+        }
+    }
+
+    Ok(map)
+}
+
+pub fn sign_all<P: AsRef<Path>>(
+    cas: HashMap<String, Ca>,
+    spec: P,
+    out: P,
+    transport: Transport,
+) -> Result<()> {
+    let spec = fs::canonicalize(spec)?;
+    debug!("canonical spec path: {}", &spec.display());
+
+    let paths = if spec.is_file() {
+        vec![spec.clone()]
+    } else {
+        config::files_with_ext(&spec, CSRSPEC_EXT)?
+            .into_iter()
+            .chain(config::files_with_ext(&spec, DCSRSPEC_EXT)?)
+            .collect::<Vec<PathBuf>>()
+    };
+
+    if paths.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no files with extensions \"{}\" or \"{}\" found in dir: {}",
+            CSRSPEC_EXT,
+            DCSRSPEC_EXT,
+            &spec.display()
+        ));
+    }
+
+    let connector = start_connector()?;
+    passwd_to_env("OKM_HSM_PKCS11_AUTH")?;
+
+    let tmp_dir = TempDir::new()?;
+    for path in paths {
+        let filename = path.file_name().unwrap().to_string_lossy();
+
+        if filename.ends_with(CSRSPEC_EXT) {
+            // process csr spec
+            info!("Signing CSR from CsrSpec: {:?}", path);
+            if let Err(e) = sign_csrspec(&path, &tmp_dir, state, publish) {
+                // Ignore possible error from killing connector because we already
+                // have an error to report and it'll be more interesting.
+                if let Some(mut c) = connector {
+                    let _ = c.kill();
+                }
+                return Err(e);
+            }
+        } else if filename.ends_with(DCSRSPEC_EXT) {
+            let mut hsm = Hsm::new(
+                0x0002,
+                &passwd_from_env("OKM_HSM_PKCS11_AUTH")?,
+                publish,
+                state,
+                false,
+                transport,
+            )?;
+
+            info!("Signing DCSR from DcsrSpec: {:?}", path);
+            if let Err(e) = sign_dcsrspec(&path, &hsm.client, state, publish) {
+                // Ignore possible error from killing connector because we already
+                // have an error to report and it'll be more interesting.
+                if let Some(mut c) = connector {
+                    let _ = c.kill();
+                }
+                return Err(e);
+            }
+            hsm.client.close_session()?;
+        } else {
+            error!("Unknown input spec: {}", path.display());
+        }
+    }
+
+    connector.kill()?;
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -336,13 +463,15 @@ fn main() -> Result<()> {
             CaCommand::Initialize {
                 key_spec,
                 pkcs11_path,
-            } => oks::ca::initialize(
-                &key_spec,
-                &pkcs11_path,
-                &args.state,
-                &args.output,
-                args.transport,
-            ),
+            } => {
+                let _ = initialize_cas(
+                    &key_spec,
+                    &pkcs11_path,
+                    &args.state,
+                    &args.output,
+                )?;
+                Ok(())
+            },
             CaCommand::Sign { csr_spec } => oks::ca::sign(
                 &csr_spec,
                 &args.state,
