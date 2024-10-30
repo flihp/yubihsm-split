@@ -5,6 +5,7 @@
 use anyhow::{anyhow, Context, Result};
 use log::{debug, error, info, warn};
 use std::{
+    collections::HashMap,
     env,
     fs::{self, OpenOptions, Permissions},
     os::unix::fs::PermissionsExt,
@@ -16,15 +17,11 @@ use std::{
 };
 use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
+use x509_cert::{certificate::Certificate, der::DecodePem};
 use yubihsm::Client;
 use zeroize::Zeroizing;
 
-use crate::{
-    config::{
-        self, CsrSpec, DcsrSpec, KeySpec, Purpose, Transport, ENV_PASSWORD,
-    },
-    hsm::Hsm,
-};
+use crate::config::{CsrSpec, DcsrSpec, KeySpec, Purpose, ENV_PASSWORD};
 
 macro_rules! openssl_cnf_fmt {
     () => {
@@ -142,9 +139,6 @@ const CA_KEY_SPEC: &str = "key.spec";
 /// Name of file in root of a CA directory containing the CA's own certificate.
 const CA_CERT: &str = "ca.cert.pem";
 
-const CSRSPEC_EXT: &str = ".csrspec.json";
-const DCSRSPEC_EXT: &str = ".dcsrspec.json";
-
 #[derive(Error, Debug)]
 pub enum CaError {
     #[error("Invalid path to CsrSpec file")]
@@ -166,6 +160,7 @@ pub enum CaError {
 // TODO: address open questions:
 // - when do we set the password (env)?
 // - when do we start the connector?
+// The `Ca` type represents a single signing key.
 pub struct Ca {
     root: PathBuf,
     spec: KeySpec,
@@ -183,7 +178,7 @@ impl Ca {
     pub fn load<P: AsRef<Path>>(root: P) -> Result<Self> {
         let root = PathBuf::from(root.as_ref());
 
-        let spec = root.join("key.spec");
+        let spec = root.join(CA_KEY_SPEC);
         let spec = fs::read_to_string(spec)?;
         let spec = KeySpec::from_str(spec.as_ref())?;
 
@@ -192,6 +187,11 @@ impl Ca {
 
     pub fn name(&self) -> String {
         self.spec.label.to_string()
+    }
+
+    pub fn cert(&self) -> Result<Certificate> {
+        let bytes = fs::read(self.root.join(CA_CERT))?;
+        Ok(Certificate::from_pem(bytes)?)
     }
 
     // The path should not exist and we create everyting from the
@@ -231,9 +231,10 @@ impl Ca {
         std::env::set_current_dir(&ca_dir)?;
 
         // copy the key spec file to the ca state dir
-        let spec_json = spec.to_json()
+        let spec_json = spec
+            .to_json()
             .context("Failed to serialize KeySpec to json")?;
-        fs::write("key.spec", spec_json)?;
+        fs::write(CA_KEY_SPEC, spec_json)?;
 
         // create directories expected by `openssl ca`: crl, newcerts
         for dir in ["crl", "newcerts", "csr"] {
@@ -352,7 +353,10 @@ impl Ca {
 
             if !output.status.success() {
                 warn!("command failed with status: {}", output.status);
-                warn!("stderr: \"{}\"", String::from_utf8_lossy(&output.stderr));
+                warn!(
+                    "stderr: \"{}\"",
+                    String::from_utf8_lossy(&output.stderr)
+                );
                 return Err(CaError::SelfCertGenFail.into());
             }
 
@@ -370,7 +374,151 @@ impl Ca {
 
         env::set_current_dir(pwd)?;
 
-        Ok(Self::load(ca_dir)?)
+        Self::load(ca_dir)
+    }
+
+    pub fn sign_csrspec(
+        &self,
+        spec: &CsrSpec,
+        name: &str,
+        publish: &Path,
+    ) -> Result<()> {
+        // sanity check: no signing keys at CA init
+        // this makes me think we need different types for this:
+        // one for the CA keys, one for the children we sign
+        // map purpose of CA key to key associated with CSR
+        let purpose = match self.spec.purpose {
+            Purpose::RoTReleaseRoot => Purpose::RoTReleaseCodeSigning,
+            Purpose::RoTDevelopmentRoot => Purpose::RoTDevelopmentCodeSigning,
+            Purpose::Identity => Purpose::Identity,
+            _ => return Err(CaError::BadPurpose.into()),
+        };
+
+        let publish = fs::canonicalize(publish)?;
+        debug!("canonical publish: {}", publish.display());
+
+        // chdir to CA state directory as required to run `openssl ca`
+        let pwd = std::env::current_dir()?;
+        debug!("got current directory: {:?}", pwd);
+        std::env::set_current_dir(&self.root)?;
+        debug!("setting current directory: {}", self.root.display());
+
+        // create a tempdir & write CSR there for openssl: AFAIK the `ca` command
+        // won't take the CSR over stdin
+        let tmp_dir = TempDir::new()?;
+        let tmp_csr = tmp_dir.path().join(format!("{}.csr.pem", name));
+        debug!("writing CSR to: {}", tmp_csr.display());
+        fs::write(&tmp_csr, &spec.csr)?;
+
+        let cert = publish.join(format!("{}.cert.pem", name));
+        debug!("writing cert to: {}", cert.display());
+
+        // sleep to let sessions cycle
+        thread::sleep(Duration::from_millis(2500));
+
+        info!(
+            "Generating cert from CSR & signing with key: {}",
+            self.spec.label.to_string()
+        );
+
+        let mut connector = start_connector()?;
+        passwd_to_env("OKM_HSM_PKCS11_AUTH")?;
+
+        let mut cmd = Command::new("openssl");
+        cmd.arg("ca")
+            .arg("-batch")
+            .arg("-notext")
+            .arg("-config")
+            .arg("openssl.cnf")
+            .arg("-engine")
+            .arg("pkcs11")
+            .arg("-keyform")
+            .arg("engine")
+            .arg("-keyfile")
+            .arg(format!("0:{:04x}", self.spec.id))
+            .arg("-extensions")
+            .arg(purpose.to_string())
+            .arg("-passin")
+            .arg("env:OKM_HSM_PKCS11_AUTH")
+            .arg("-in")
+            .arg(&tmp_csr)
+            .arg("-out")
+            .arg(&cert);
+
+        debug!("executing command: \"{:#?}\"", cmd);
+        // kill the connector before possibly handling errors
+        // ignore errors from killing the connector
+        let output = match cmd.output() {
+            Ok(o) => {
+                connector.kill()?;
+                o
+            }
+            Err(e) => {
+                let _ = connector.kill();
+                return Err(e.into());
+            }
+        };
+
+        if !output.status.success() {
+            warn!("command failed with status: {}", output.status);
+            warn!("stderr: \"{}\"", String::from_utf8_lossy(&output.stderr));
+            return Err(CaError::CertGenFail.into());
+        }
+
+        std::env::set_current_dir(pwd)?;
+
+        Ok(())
+    }
+
+    pub fn sign_dcsrspec(
+        &self,
+        spec: DcsrSpec,
+        name: &str,
+        cas: &HashMap<String, Ca>,
+        client: &Client,
+        publish: &Path,
+    ) -> Result<()> {
+        // Collect certs for the 4 trust anchors listed in the `root_labels`.
+        // These are the 4 trust anchors trusted by the lpc55 verified boot.
+        let mut certs: Vec<Certificate> = Vec::new();
+        for label in spec.root_labels {
+            let ca = cas.get(label.try_as_str()?).ok_or(anyhow!(
+                "no Ca \"{}\" for DcsrSpec root labels",
+                label
+            ))?;
+            certs.push(ca.cert()?);
+        }
+        let certs = certs;
+        // TODO: sanity checks
+        // certs should all be self signed
+        // signing keys must / should all be Rsa4k
+
+        // Get public key from the cert of the Ca signing the Dcsr (self).
+        let cert = self.cert()?;
+        let signer_public_key = lpc55_sign::cert::public_key(&cert)?;
+
+        // Construct the to-be-signed debug credential
+        let dc_tbs = lpc55_sign::debug_auth::debug_credential_tbs(
+            certs,
+            signer_public_key,
+            spec.dcsr,
+        )?;
+
+        // Sign it using the private key stored in the HSM.
+        let dc_sig = client.sign_rsa_pkcs1v15_sha256(self.spec.id, &dc_tbs)?;
+
+        // Append the signature to the TBS debug credential to make a complete debug
+        // credential
+        let mut dc = Vec::new();
+        dc.extend_from_slice(&dc_tbs);
+        dc.extend_from_slice(&dc_sig.into_vec());
+
+        // Write the debug credential to the output directory
+        let dc_path = publish.join(format!("{}.dc.bin", name));
+        debug!("writing debug credential to: {}", dc_path.display());
+        std::fs::write(dc_path, &dc)?;
+
+        Ok(())
     }
 }
 
@@ -390,14 +538,6 @@ fn passwd_to_env(env_str: &str) -> Result<()> {
     Ok(())
 }
 
-fn passwd_from_env(env_str: &str) -> Result<String> {
-    Ok(std::env::var(env_str)?
-            .strip_prefix("0002")
-            .ok_or_else(|| anyhow!("Missing key identifier prefix in environment variable \"{env_str}\" that is expected to contain an HSM password"))?
-            .to_string()
-        )
-}
-
 /// Start the yubihsm-connector process.
 /// NOTE: The connector dumps ~10 lines of text for each command.
 /// We can increase verbosity with the `-debug` flag, but the only way
@@ -414,209 +554,4 @@ fn start_connector() -> Result<Child> {
     std::thread::sleep(std::time::Duration::from_millis(1000));
 
     Ok(child)
-}
-
-pub fn sign_csrspec(
-    csr_spec_path: &Path,
-    tmp_dir: &TempDir,
-    state: &Path,
-    publish: &Path,
-) -> Result<()> {
-    // deserialize the csrspec
-    debug!("Getting CSR spec from: {}", csr_spec_path.display());
-    let json = fs::read_to_string(csr_spec_path)?;
-    debug!("spec as json: {}", json);
-
-    let csr_spec = CsrSpec::from_str(&json)?;
-    debug!("CsrSpec: {:#?}", csr_spec);
-
-    // get the label
-    // use label to reconstruct path to CA root dir for key w/ label
-    let key_spec = state.join(csr_spec.label.to_string()).join(CA_KEY_SPEC);
-
-    debug!("Getting KeySpec from: {}", key_spec.display());
-    let json = fs::read_to_string(key_spec)?;
-    debug!("spec as json: {}", json);
-
-    let key_spec = KeySpec::from_str(&json)?;
-    debug!("KeySpec: {:#?}", key_spec);
-
-    // sanity check: no signing keys at CA init
-    // this makes me think we need different types for this:
-    // one for the CA keys, one for the children we sign
-    // map purpose of CA key to key associated with CSR
-    let purpose = match key_spec.purpose {
-        Purpose::RoTReleaseRoot => Purpose::RoTReleaseCodeSigning,
-        Purpose::RoTDevelopmentRoot => Purpose::RoTDevelopmentCodeSigning,
-        Purpose::Identity => Purpose::Identity,
-        _ => return Err(CaError::BadPurpose.into()),
-    };
-
-    let publish = fs::canonicalize(publish)?;
-    debug!("canonical publish: {}", publish.display());
-
-    // pushd into ca dir based on spec file
-    let pwd = std::env::current_dir()?;
-    debug!("got current directory: {:?}", pwd);
-
-    let ca_dir = state.join(key_spec.label.to_string());
-    std::env::set_current_dir(&ca_dir)?;
-    debug!("setting current directory: {}", ca_dir.display());
-
-    // Get prefix from CsrSpec file. We us this to generate file names for the
-    // temp CSR file and the output cert file.
-    let csr_filename = match csr_spec_path
-        .file_name()
-        .ok_or(CaError::BadCsrSpecPath)?
-        .to_os_string()
-        .into_string()
-    {
-        Ok(s) => s,
-        Err(_) => return Err(CaError::BadCsrSpecPath.into()),
-    };
-    let csr_prefix = match csr_filename.find('.') {
-        Some(i) => csr_filename[..i].to_string(),
-        None => csr_filename,
-    };
-
-    // create a tempdir & write CSR there for openssl: AFAIK the `ca` command
-    // won't take the CSR over stdin
-    let tmp_csr = tmp_dir.path().join(format!("{}.csr.pem", csr_prefix));
-    debug!("writing CSR to: {}", tmp_csr.display());
-    fs::write(&tmp_csr, &csr_spec.csr)?;
-
-    let cert = publish.join(format!("{}.cert.pem", csr_prefix));
-    debug!("writing cert to: {}", cert.display());
-
-    // sleep to let sessions cycle
-    thread::sleep(Duration::from_millis(2500));
-
-    // execute CA command
-    info!(
-        "Generating cert from CSR & signing with key: {}",
-        key_spec.label.to_string()
-    );
-    let mut cmd = Command::new("openssl");
-    cmd.arg("ca")
-        .arg("-batch")
-        .arg("-notext")
-        .arg("-config")
-        .arg("openssl.cnf")
-        .arg("-engine")
-        .arg("pkcs11")
-        .arg("-keyform")
-        .arg("engine")
-        .arg("-keyfile")
-        .arg(format!("0:{:04x}", key_spec.id))
-        .arg("-extensions")
-        .arg(purpose.to_string())
-        .arg("-passin")
-        .arg("env:OKM_HSM_PKCS11_AUTH")
-        .arg("-in")
-        .arg(&tmp_csr)
-        .arg("-out")
-        .arg(&cert);
-
-    debug!("executing command: \"{:#?}\"", cmd);
-    let output = cmd.output()?;
-
-    if !output.status.success() {
-        warn!("command failed with status: {}", output.status);
-        warn!("stderr: \"{}\"", String::from_utf8_lossy(&output.stderr));
-        return Err(CaError::CertGenFail.into());
-    }
-
-    std::env::set_current_dir(pwd)?;
-
-    Ok(())
-}
-
-fn sign_dcsrspec(
-    dcsr_spec_path: &Path,
-    client: &Client,
-    state: &Path,
-    publish: &Path,
-) -> Result<()> {
-    let dcsr_spec_json =
-        std::fs::read_to_string(dcsr_spec_path).with_context(|| {
-            format!(
-                "Failed to read DcsrSpec json from {}",
-                dcsr_spec_path.display()
-            )
-        })?;
-    let dcsr_spec: DcsrSpec = serde_json::from_str(&dcsr_spec_json)
-        .context("Failed to deserialize DcsrSpec from json")?;
-
-    let root_cert_paths = dcsr_spec
-        .root_labels
-        .iter()
-        .map(|x| state.join(x.to_string()).join(CA_CERT))
-        .collect::<Vec<PathBuf>>();
-    let root_certs = lpc55_sign::cert::read_certs(&root_cert_paths)
-        .context("Failed to get certs for DCSR root labels.")?;
-
-    // Load signer's public key
-    let mut signer_public_key = None;
-    for (idx, label) in dcsr_spec.root_labels.iter().enumerate() {
-        if *label == dcsr_spec.label {
-            if let Some(x) = root_certs.get(idx) {
-                signer_public_key = Some(lpc55_sign::cert::public_key(x)?)
-            }
-        }
-    }
-    let signer_public_key = signer_public_key.ok_or_else(|| {
-        anyhow!(
-            "DcsrSpec label \"{}\" must also be one of the root labels",
-            dcsr_spec.label
-        )
-    })?;
-
-    // Load signing key's KeySpec
-    let key_spec = state.join(dcsr_spec.label.to_string()).join(CA_KEY_SPEC);
-
-    debug!("Getting KeySpec from: {}", key_spec.display());
-    let json = fs::read_to_string(key_spec)?;
-    debug!("spec as json: {}", json);
-
-    let key_spec = KeySpec::from_str(&json)?;
-    debug!("KeySpec: {:#?}", key_spec);
-
-    // Get prefix from DcsrSpec file. We us this to generate file names for the
-    // output file.
-    let dcsr_filename = match dcsr_spec_path
-        .file_name()
-        .ok_or(CaError::BadDcsrSpecPath)?
-        .to_os_string()
-        .into_string()
-    {
-        Ok(s) => s,
-        Err(_) => return Err(CaError::BadCsrSpecPath.into()),
-    };
-    let dcsr_prefix = match dcsr_filename.find('.') {
-        Some(i) => dcsr_filename[..i].to_string(),
-        None => dcsr_filename,
-    };
-
-    // Construct the to-be-signed debug credential
-    let dc_tbs = lpc55_sign::debug_auth::debug_credential_tbs(
-        root_certs,
-        signer_public_key,
-        dcsr_spec.dcsr,
-    )?;
-
-    // Sign it using the private key stored in the HSM.
-    let dc_sig = client.sign_rsa_pkcs1v15_sha256(key_spec.id, &dc_tbs)?;
-
-    // Append the signature to the TBS debug credential to make a complete debug
-    // credential
-    let mut dc = Vec::new();
-    dc.extend_from_slice(&dc_tbs);
-    dc.extend_from_slice(&dc_sig.into_vec());
-
-    // Write the debug credential to the output directory
-    let dc_path = publish.join(format!("{}.dc.bin", dcsr_prefix));
-    debug!("writing debug credential to: {}", dc_path.display());
-    std::fs::write(dc_path, &dc)?;
-
-    Ok(())
 }

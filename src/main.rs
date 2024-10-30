@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use env_logger::Builder;
 use log::{debug, error, info, LevelFilter};
@@ -16,8 +16,11 @@ use yubihsm::object::{Id, Type};
 use zeroize::Zeroizing;
 
 use oks::{
-    config::{self, KeySpec, Transport, ENV_NEW_PASSWORD, ENV_PASSWORD, KEYSPEC_EXT},
     ca::Ca,
+    config::{
+        self, CsrSpec, DcsrSpec, KeySpec, Transport, CSRSPEC_EXT, DCSRSPEC_EXT,
+        ENV_NEW_PASSWORD, ENV_PASSWORD, KEYSPEC_EXT,
+    },
     hsm::{self, Hsm},
 };
 
@@ -166,7 +169,7 @@ fn make_dir(path: &Path) -> Result<()> {
         );
         Ok(fs::create_dir_all(path)?)
     } else if !path.is_dir() {
-        Err(anyhow::anyhow!(
+        Err(anyhow!(
             "directory provided is not a directory: \"{}\"",
             path.display()
         ))
@@ -312,17 +315,10 @@ fn do_ceremony(
     // set env var for oks::ca module to pickup for PKCS11 auth
     env::set_var(ENV_PASSWORD, &passwd_new);
     // for each key_spec in `key_spec` initialize Ca
-    let _ = initialize_cas(
-        key_spec,
-        pkcs11_path,
-        &args.state,
-        &args.output,
-    )?;
-    Ok(())
-//    oks::ca::sign(csr_spec, &args.state, &args.output, args.transport)
+    let cas =
+        initialize_all_ca(key_spec, pkcs11_path, &args.state, &args.output)?;
+    sign_all(&cas, csr_spec, &args.state, &args.output, args.transport)
 }
-
-//fn sign_all(cas: HashMap<Label, Ca>,
 
 pub fn initialize_all_ca(
     key_spec: &Path,
@@ -340,7 +336,7 @@ pub fn initialize_all_ca(
     };
 
     if paths.is_empty() {
-        return Err(anyhow::anyhow!(
+        return Err(anyhow!(
             "no files with extension \"{}\" found in dir: {}",
             KEYSPEC_EXT,
             &key_spec.display()
@@ -353,7 +349,7 @@ pub fn initialize_all_ca(
         debug!("canonical KeySpec path: {}", spec.display());
 
         if !spec.is_file() {
-            return Err(anyhow::anyhow!("path to KeySpec isn't a file"));
+            return Err(anyhow!("path to KeySpec isn't a file"));
         }
 
         let spec_json = fs::read_to_string(spec)?;
@@ -361,16 +357,40 @@ pub fn initialize_all_ca(
 
         let ca = Ca::initialize(spec, ca_state, pkcs11_path, out)?;
         if map.insert(ca.name(), ca).is_some() {
-            return Err(anyhow::anyhow!("duplicate key label").into());
+            return Err(anyhow!("duplicate key label"));
         }
     }
 
     Ok(map)
 }
 
+pub fn load_all_ca<P: AsRef<Path>>(ca_state: P) -> Result<HashMap<String, Ca>> {
+    // find all directories under `ca_state`
+    // for each directory in `ca_state`, Ca::load(directory)
+    // insert into hash map
+    let dirs: Vec<PathBuf> = fs::read_dir(ca_state.as_ref())?
+        .filter(|x| x.is_ok()) // filter out error variant to make unwrap safe
+        .map(|r| r.unwrap().path()) // get paths
+        .filter(|x| x.is_dir()) // filter out every path that isn't a directory
+        .collect();
+    let mut cas: HashMap<String, Ca> = HashMap::new();
+    for dir in dirs {
+        let ca = Ca::load(dir)?;
+        if cas.insert(ca.name(), ca).is_some() {
+            return Err(anyhow!("found CA with duplicate key label"));
+        }
+    }
+
+    Ok(cas)
+}
+
+// Process all relevant spec files (CsrSpec & DcsrSpec) from the provided
+// path. From these spec files we determine which Ca should sign them. The
+// resulting certs / credentials are written to `out`.
 pub fn sign_all<P: AsRef<Path>>(
-    cas: HashMap<String, Ca>,
+    cas: &HashMap<String, Ca>,
     spec: P,
+    state: P,
     out: P,
     transport: Transport,
 ) -> Result<()> {
@@ -387,7 +407,7 @@ pub fn sign_all<P: AsRef<Path>>(
     };
 
     if paths.is_empty() {
-        return Err(anyhow::anyhow!(
+        return Err(anyhow!(
             "no files with extensions \"{}\" or \"{}\" found in dir: {}",
             CSRSPEC_EXT,
             DCSRSPEC_EXT,
@@ -395,52 +415,101 @@ pub fn sign_all<P: AsRef<Path>>(
         ));
     }
 
-    let connector = start_connector()?;
-    passwd_to_env("OKM_HSM_PKCS11_AUTH")?;
-
-    let tmp_dir = TempDir::new()?;
     for path in paths {
         let filename = path.file_name().unwrap().to_string_lossy();
 
         if filename.ends_with(CSRSPEC_EXT) {
-            // process csr spec
+            debug!("Getting CSR spec from: {}", path.display());
+            // Get prefix from CsrSpec file. We us this to generate names for the
+            // temp CSR file and the output cert file.
+            let csr_filename = path
+                .file_name()
+                .ok_or(anyhow!("Failed to get name from CsrSpec file path"))?
+                .to_os_string()
+                .into_string()
+                .map_err(|_| {
+                    anyhow!("Failed to convert CsrSpec file path to string")
+                })?;
+            let csr_prefix = match csr_filename.find('.') {
+                Some(i) => csr_filename[..i].to_string(),
+                None => csr_filename,
+            };
+
+            // deserialize CsrSpec & find CA to sign it (from csrspec.label)
+            let json = fs::read_to_string(&path)?;
+            debug!("spec as json: {}", json);
+
+            let csr_spec = CsrSpec::from_str(&json)?;
+            debug!("CsrSpec: {:#?}", csr_spec);
+
+            let ca_name = csr_spec.label.to_string();
+            let ca = cas
+                .get(&ca_name)
+                .ok_or(anyhow!("no CA \"{}\" for CsrSpec", ca_name))?;
             info!("Signing CSR from CsrSpec: {:?}", path);
-            if let Err(e) = sign_csrspec(&path, &tmp_dir, state, publish) {
-                // Ignore possible error from killing connector because we already
-                // have an error to report and it'll be more interesting.
-                if let Some(mut c) = connector {
-                    let _ = c.kill();
-                }
-                return Err(e);
-            }
+            ca.sign_csrspec(&csr_spec, &csr_prefix, out.as_ref())?;
         } else if filename.ends_with(DCSRSPEC_EXT) {
+            let json = std::fs::read_to_string(&path).with_context(|| {
+                format!("Failed to read DcsrSpec json from {}", path.display())
+            })?;
+            let dcsr_spec: DcsrSpec = serde_json::from_str(&json)
+                .context("Failed to deserialize DcsrSpec from json")?;
+            let ca_name = dcsr_spec.label.to_string();
+            let signer = cas
+                .get(&ca_name)
+                .ok_or(anyhow!("no Ca \"{}\" for DcsrSpec", ca_name))?;
+
             let mut hsm = Hsm::new(
                 0x0002,
-                &passwd_from_env("OKM_HSM_PKCS11_AUTH")?,
-                publish,
-                state,
+                // TODO: this will probably not work
+                // This assumes that the OKM_HSM_PKCS11_AUTH env var has
+                // already been set up. When this code was in the ca module
+                // that was true but it may not be here.
+                &passwd_from_env("OKS_HSM_PKCS11_AUTH")?,
+                out.as_ref(),
+                state.as_ref(),
                 false,
                 transport,
             )?;
 
+            let dcsr_filename = match path
+                .file_name()
+                .ok_or(anyhow!("Invalid path to DcsrSpec file"))?
+                .to_os_string()
+                .into_string()
+            {
+                Ok(s) => s,
+                Err(_) => return Err(anyhow!("Invalid path to DcsrSpec file")),
+            };
+            let dcsr_prefix = match dcsr_filename.find('.') {
+                Some(i) => dcsr_filename[..i].to_string(),
+                None => dcsr_filename,
+            };
+
             info!("Signing DCSR from DcsrSpec: {:?}", path);
-            if let Err(e) = sign_dcsrspec(&path, &hsm.client, state, publish) {
-                // Ignore possible error from killing connector because we already
-                // have an error to report and it'll be more interesting.
-                if let Some(mut c) = connector {
-                    let _ = c.kill();
-                }
-                return Err(e);
-            }
+            signer.sign_dcsrspec(
+                dcsr_spec,
+                &dcsr_prefix,
+                cas,
+                &hsm.client,
+                out.as_ref(),
+            )?;
             hsm.client.close_session()?;
         } else {
             error!("Unknown input spec: {}", path.display());
         }
     }
 
-    connector.kill()?;
-
     Ok(())
+}
+
+// TODO: this is sketchy ... likely an artifact of bad / no design
+fn passwd_from_env(env_str: &str) -> Result<String> {
+    Ok(std::env::var(env_str)?
+            .strip_prefix("0002")
+            .ok_or_else(|| anyhow!("Missing key identifier prefix in environment variable \"{env_str}\" that is expected to contain an HSM password"))?
+            .to_string()
+        )
 }
 
 fn main() -> Result<()> {
@@ -464,20 +533,24 @@ fn main() -> Result<()> {
                 key_spec,
                 pkcs11_path,
             } => {
-                let _ = initialize_cas(
+                let _ = initialize_all_ca(
                     &key_spec,
                     &pkcs11_path,
                     &args.state,
                     &args.output,
                 )?;
                 Ok(())
-            },
-            CaCommand::Sign { csr_spec } => oks::ca::sign(
-                &csr_spec,
-                &args.state,
-                &args.output,
-                args.transport,
-            ),
+            }
+            CaCommand::Sign { csr_spec } => {
+                let cas = load_all_ca(&args.state)?;
+                sign_all(
+                    &cas,
+                    &csr_spec,
+                    &args.state,
+                    &args.output,
+                    args.transport,
+                )
+            }
         },
         Command::Hsm {
             auth_id,

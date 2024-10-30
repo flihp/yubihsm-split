@@ -28,6 +28,8 @@ pub const ENV_PASSWORD: &str = "OKS_PASSWORD";
 pub const ENV_NEW_PASSWORD: &str = "OKS_NEW_PASSWORD";
 
 pub const KEYSPEC_EXT: &str = ".keyspec.json";
+pub const CSRSPEC_EXT: &str = ".csrspec.json";
+pub const DCSRSPEC_EXT: &str = ".dcsrspec.json";
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -98,7 +100,7 @@ impl TryFrom<Domain> for OksDomain {
     fn try_from(val: Domain) -> Result<Self, Self::Error> {
         match val {
             Domain::DOM1 => Ok(OksDomain::DOM1),
-            _ => Err(ConfigError::UnsupportedDomain)
+            _ => Err(ConfigError::UnsupportedDomain),
         }
     }
 }
@@ -145,7 +147,7 @@ impl TryFrom<Capability> for OksCapability {
         if val == Capability::all() {
             Ok(OksCapability::All)
         } else {
-            Err(ConfigError::BadCapability.into())
+            Err(ConfigError::BadCapability)
         }
     }
 }
@@ -210,9 +212,18 @@ impl TryFrom<&KeySpec> for OksKeySpec {
             hash: spec.hash,
             label: spec.label.clone().try_into()?,
             purpose: spec.purpose,
-            initial_serial_number: match spec.initial_serial_number.to_bytes_be().try_into() {
+            initial_serial_number: match spec
+                .initial_serial_number
+                .to_bytes_be()
+                .try_into()
+            {
                 Ok(sn) => sn,
-                Err(v) => return Err(anyhow::anyhow!("Expected array of 20 bytes, got {}", v.len()).into()),
+                Err(v) => {
+                    return Err(anyhow::anyhow!(
+                        "Expected array of 20 bytes, got {}",
+                        v.len()
+                    ));
+                }
             },
             self_signed: spec.self_signed,
         })
