@@ -218,17 +218,19 @@ impl Ca {
             _ => return Err(CaError::BadPurpose.into()),
         }
 
+        let label = spec.label.to_string();
+
+        // this is easier than remembering where we are when we chdir around
+        let ca_dir = fs::canonicalize(root)?.join(&label);
+        let out = fs::canonicalize(out)?;
+
+        info!("Bootstrapping CA files at: {}", ca_dir.display());
+        fs::create_dir_all(&ca_dir)?;
+
         let pwd = std::env::current_dir()?;
         debug!("got current directory: {:?}", pwd);
-
-        // setup CA directory structure
-        let label = spec.label.to_string();
-        let root = PathBuf::from(root.as_ref());
-        let ca_dir = root.join(&label);
-        fs::create_dir_all(&ca_dir)?;
-        info!("Bootstrapping CA files for key with label: {}", &label);
-        debug!("setting current directory: {}", ca_dir.display());
         std::env::set_current_dir(&ca_dir)?;
+        debug!("set current directory to: {:?}", ca_dir);
 
         // copy the key spec file to the ca state dir
         let spec_json = spec
@@ -237,21 +239,18 @@ impl Ca {
         fs::write(CA_KEY_SPEC, spec_json)?;
 
         // create directories expected by `openssl ca`: crl, newcerts
-        for dir in ["crl", "newcerts", "csr"] {
+        for dir in ["crl", "newcerts", "csr", "private"] {
             debug!("creating directory: {}?", dir);
             fs::create_dir(dir)?;
+            if dir == "private" {
+                let perms = Permissions::from_mode(0o700);
+                debug!(
+                    "setting permissions on directory {} to {:#?}",
+                    dir, perms
+                );
+                fs::set_permissions(dir, perms)?;
+            }
         }
-
-        // the 'private' directory is a special case w/ restricted permissions
-        let priv_dir = "private";
-        debug!("creating directory: {}?", priv_dir);
-        fs::create_dir(priv_dir)?;
-        let perms = Permissions::from_mode(0o700);
-        debug!(
-            "setting permissions on directory {} to {:#?}",
-            priv_dir, perms
-        );
-        fs::set_permissions(priv_dir, perms)?;
 
         // touch 'index.txt' file
         let index = "index.txt";
@@ -315,10 +314,11 @@ impl Ca {
         if !output.status.success() {
             warn!("command failed with status: {}", output.status);
             warn!("stderr: \"{}\"", String::from_utf8_lossy(&output.stderr));
+            env::set_current_dir(pwd)?;
             return Err(CaError::SelfCertGenFail.into());
         }
 
-        let out = PathBuf::from(out.as_ref());
+        // return the path to the artifact created
         if spec.self_signed {
             // sleep to let sessions cycle
             thread::sleep(Duration::from_millis(1500));
@@ -346,7 +346,7 @@ impl Ca {
                 .arg("-in")
                 .arg(csr.path())
                 .arg("-out")
-                .arg("ca.cert.pem")
+                .arg(CA_CERT)
                 .output()?;
 
             debug!("executing command: \"{:#?}\"", cmd);
@@ -357,22 +357,38 @@ impl Ca {
                     "stderr: \"{}\"",
                     String::from_utf8_lossy(&output.stderr)
                 );
+                env::set_current_dir(pwd)?;
                 return Err(CaError::SelfCertGenFail.into());
             }
 
-            let cert = out.join(format!("{}.cert.pem", label));
-            fs::copy("ca.cert.pem", cert)?;
+            let src = ca_dir.join(CA_CERT);
+            let dst = out.join(format!("{}.cert.pem", label));
+            fs::copy(&src, &dst).with_context(|| {
+                format!(
+                    "Failed to copy self signed cert from \"{}\" to \"{}\"",
+                    src.display(),
+                    dst.display()
+                )
+            })?;
         } else {
-            // when we're not generating a self signed cert we copy the csr
-            // to the output directory so it can be certified through an
-            // external process
-            fs::copy(csr, out.join(format!("{}.csr.pem", label)))?;
+            // self-signed=false in keyspec indicates that the CA being
+            // initialized is an intermediate: someone else has to certify it
+            // so we copy the CSR to output
+            let dst = out.join(format!("{}.csr.pem", label));
+            fs::copy(&csr, &dst).with_context(|| {
+                format!(
+                    "copying CSR from \"{}\" to \"{}\"",
+                    csr.path().display(),
+                    dst.display()
+                )
+            })?;
         }
+
+        debug!("restoring pwd to: {}", pwd.display());
+        env::set_current_dir(pwd)?;
 
         // done w/ openssl cmds, kill connector
         connector.kill()?;
-
-        env::set_current_dir(pwd)?;
 
         Self::load(ca_dir)
     }
