@@ -3,19 +3,27 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use anyhow::Result;
+use log::debug;
 use std::{
     io::{self, Read, Write},
     ops::Deref,
 };
 use zeroize::Zeroizing;
 
-use crate::backup::{Share, Verifier};
+use crate::{
+    backup::{Share, Verifier},
+    cdrw::Cdr,
+};
+
+pub trait PasswordReader {
+    fn read(&mut self, prompt: &str) -> Result<Zeroizing<String>>;
+}
 
 #[derive(Default)]
 pub struct StdioPasswordReader {}
 
-impl StdioPasswordReader {
-    pub fn read(&self, prompt: &str) -> Result<Zeroizing<String>> {
+impl PasswordReader for StdioPasswordReader {
+    fn read(&mut self, prompt: &str) -> Result<Zeroizing<String>> {
         Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
     }
 }
@@ -124,6 +132,101 @@ impl Iterator for StdioShareReader {
             if verified {
                 break Some(Ok(share));
             }
+        }
+    }
+}
+
+pub struct CdrPasswordReader {
+    cdr: Cdr,
+}
+
+impl CdrPasswordReader {
+    pub fn new(cdr: Cdr) -> Self {
+        Self { cdr }
+    }
+}
+
+impl PasswordReader for CdrPasswordReader {
+    // TODO: figure out user interaction / prompt stuff
+    // TODO: if this were to consume `self` we may be able to make
+    // `Cdr::teardown` do the same ...
+    fn read(&mut self, _prompt: &str) -> Result<Zeroizing<String>> {
+        self.cdr.mount()?;
+
+        let password = self.cdr.read("password")?;
+
+        // Passwords are utf8 and `String::from_utf8` explicitly does *not*
+        // copy the Vec<u8>.
+        let password = Zeroizing::new(String::from_utf8(password)?);
+        debug!("read password: {:?}", password.deref());
+        self.cdr.teardown();
+
+        Ok(password)
+    }
+}
+
+pub struct CdrShareReader {
+    cdr: Cdr,
+    verifier: Verifier,
+}
+
+impl CdrShareReader {
+    pub fn new(cdr: Cdr, verifier: Verifier) -> Self {
+        Self { cdr, verifier }
+    }
+}
+
+impl Iterator for CdrShareReader {
+    type Item = Result<Zeroizing<Share>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.cdr.eject() {
+            Ok(()) => (),
+            Err(e) => return Some(Err(e)),
+        }
+
+        print!(
+            "Place keyshare CD in the drive, close the drive, then press \n\
+               any key to continue: "
+        );
+        match io::stdout().flush() {
+            Ok(()) => (),
+            Err(e) => return Some(Err(e.into())),
+        }
+        // wait for user input
+        let _ = match io::stdin().read(&mut [0u8]) {
+            Ok(_) => (),
+            Err(e) => return Some(Err(e.into())),
+        };
+
+        // TODO: retry loop
+        // a drive tested errors out very quickly if the drive is still
+        // reading the disk, another will just block until data is ready
+        // ¯\_(ツ)_/¯
+        match self.cdr.mount() {
+            Ok(()) => (),
+            Err(e) => return Some(Err(e)),
+        }
+        let share = match self.cdr.read("share") {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e)),
+        };
+        println!("\nOK");
+
+        let share = match Share::try_from(share.deref()) {
+            Ok(s) => Zeroizing::new(s),
+            Err(e) => return Some(Err(e.into())),
+        };
+
+        match verify(&self.verifier, &share) {
+            Ok(b) => {
+                if b {
+                    Some(Ok(share))
+                } else {
+                    Some(Err(anyhow::anyhow!("verification failed")))
+                }
+            }
+            Err(e) => Some(Err(e)),
         }
     }
 }

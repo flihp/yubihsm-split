@@ -4,6 +4,7 @@
 
 pub mod backup;
 pub mod ca;
+pub mod cdrw;
 pub mod config;
 pub mod hsm;
 pub mod secret_reader;

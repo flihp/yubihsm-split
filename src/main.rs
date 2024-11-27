@@ -24,7 +24,7 @@ use oks::{
         ENV_NEW_PASSWORD, ENV_PASSWORD, KEYSPEC_EXT,
     },
     hsm::Hsm,
-    secret_reader::{StdioPasswordReader, StdioShareReader},
+    secret_reader::{PasswordReader, StdioPasswordReader, StdioShareReader},
     secret_writer::{PrinterSecretWriter, DEFAULT_PRINT_DEV},
     util,
 };
@@ -203,7 +203,7 @@ fn get_passwd(
     let passwd = match env::var(ENV_PASSWORD).ok() {
         Some(s) => Zeroizing::new(s),
         None => {
-            let passwd_reader = StdioPasswordReader::default();
+            let mut passwd_reader = StdioPasswordReader::default();
             if auth_id.is_some() {
                 // if auth_id was set by the caller but not the password we
                 // prompt for the password
@@ -248,7 +248,7 @@ fn get_new_passwd(hsm: Option<&Hsm>) -> Result<Zeroizing<String>> {
             }
             // last option: challenge the caller
             None => {
-                let passwd_reader = StdioPasswordReader::default();
+                let mut passwd_reader = StdioPasswordReader::default();
                 loop {
                     let password = passwd_reader.read(PASSWD_NEW)?;
                     let password2 = passwd_reader.read(PASSWD_NEW_2)?;
