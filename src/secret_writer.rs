@@ -10,11 +10,16 @@ use std::{
     ffi::OsStr,
     fs::{File, OpenOptions},
     io::Write,
+    ops::Deref,
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
 
-use crate::{backup::Share, cdrw::Cdw, util};
+use crate::{
+    backup::Share,
+    cdrw::{Cdw, IsoWriter},
+    util,
+};
 
 pub const DEFAULT_PRINT_DEV: &str = "/dev/usb/lp0";
 
@@ -294,7 +299,7 @@ impl SecretWriter for CdwSecretWriter {
     ) -> Result<()> {
         let cdw = Cdw::new(self.device.as_ref())?;
 
-        cdw.write_share(share.as_ref())?;
+        cdw.write_share(share)?;
         cdw.burn()?;
 
         Ok(())
@@ -318,21 +323,22 @@ impl IsoSecretWriter {
 
 impl SecretWriter for IsoSecretWriter {
     fn password(&self, password: &Zeroizing<String>) -> Result<()> {
-        let cdw = Cdw::new::<PathBuf>(None)?;
+        let writer = IsoWriter::new()?;
 
-        cdw.write_password(password)?;
-        cdw.to_iso(self.output_dir.join("password.iso"))
+        writer.add("password", password.deref().as_bytes())?;
+        writer.to_iso(self.output_dir.join("password.iso"))
     }
+
     fn share(
         &self,
         index: usize,
         limit: usize,
         share: &Zeroizing<Share>,
     ) -> Result<()> {
-        let cdw = Cdw::new::<PathBuf>(None)?;
+        let writer = IsoWriter::new()?;
 
-        cdw.write_share(share.as_ref())?;
-        cdw.to_iso(
+        writer.add("share", share.as_ref())?;
+        writer.to_iso(
             self.output_dir
                 .join(format!("share_{}-of-{}.iso", index, limit)),
         )

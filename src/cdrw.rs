@@ -6,12 +6,15 @@ use anyhow::{Context, Result};
 use log::{debug, warn};
 use std::{
     fs,
+    ops::Deref,
     path::{Path, PathBuf},
     process::Command,
 };
 use tempfile::{tempdir, TempDir};
 use thiserror::Error;
 use zeroize::Zeroizing;
+
+use crate::backup::Share;
 
 pub const DEFAULT_CDRW_DEV: &str = "/dev/cdrom";
 
@@ -220,56 +223,27 @@ impl Cdr {
     }
 }
 
-pub struct Cdw {
-    tmp: TempDir,
-    device: PathBuf,
+pub struct IsoWriter {
+    tmpdir: TempDir,
 }
 
-impl Cdw {
-    // If `device` is `None` then we will only create an iso and return the
-    // bytes.
-    pub fn new<P: AsRef<Path>>(device: Option<P>) -> Result<Self> {
-        let device = match device {
-            Some(s) => PathBuf::from(s.as_ref()),
-            None => PathBuf::from(DEFAULT_CDRW_DEV),
-        };
-        Ok(Self {
-            device,
-            tmp: tempdir()?,
-        })
+impl IsoWriter {
+    pub fn new() -> Result<Self> {
+        Ok(Self { tmpdir: tempdir()? })
     }
 
-    pub fn add<P: AsRef<Path>>(&self, src: &P) -> Result<()> {
-        let name = src.as_ref().file_name().ok_or(CdrwError::BadSrc)?;
-        let dst = self.tmp.path().join(name);
+    pub fn add(&self, name: &str, data: &[u8]) -> Result<()> {
+        let dst = self.tmpdir.path().join(name);
 
-        let _ = fs::copy(src, &dst).context(format!(
-            "Failed to copy source \"{}\" to destination \"{}\"",
-            src.as_ref().display(),
+        fs::write(&dst, data).context(format!(
+            "Failed to write data to: \"{}\"",
             dst.display()
         ))?;
+
         Ok(())
     }
 
-    pub fn write_password(&self, data: &Zeroizing<String>) -> Result<()> {
-        let path = self.tmp.as_ref().join("password");
-        debug!(
-            "Writing password: {} to: {}",
-            <Zeroizing<String> as AsRef<str>>::as_ref(data),
-            path.display()
-        );
-
-        Ok(fs::write(path, data)?)
-    }
-
-    pub fn write_share(&self, data: &[u8]) -> Result<()> {
-        let path = self.tmp.as_ref().join("share");
-        debug!("Writing share: {:?} to: {}", data, path.display());
-
-        Ok(fs::write(path, data)?)
-    }
-
-    pub fn to_iso<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+    pub fn to_iso<P: AsRef<Path>>(self, path: P) -> Result<()> {
         let mut cmd = Command::new("mkisofs");
         let output = cmd
             .arg("-r")
@@ -277,12 +251,13 @@ impl Cdw {
             .arg("4")
             .arg("-o")
             .arg(path.as_ref())
-            .arg(self.tmp.as_ref())
+            .arg(self.tmpdir.as_ref())
             .output()
             .with_context(|| {
                 format!(
-                    "failed to create state ISO at \"{}\"",
-                    self.tmp.as_ref().display()
+                    "failed to create ISO \"{}\" from dir \"{}\"",
+                    path.as_ref().display(),
+                    self.tmpdir.as_ref().display()
                 )
             })?;
 
@@ -294,13 +269,45 @@ impl Cdw {
 
         Ok(())
     }
+}
+
+pub struct Cdw {
+    iso_writer: IsoWriter,
+    device: PathBuf,
+}
+
+impl Cdw {
+    pub fn new<P: AsRef<Path>>(device: Option<P>) -> Result<Self> {
+        let device = match device {
+            Some(s) => PathBuf::from(s.as_ref()),
+            None => PathBuf::from(DEFAULT_CDRW_DEV),
+        };
+
+        Ok(Self {
+            device,
+            iso_writer: IsoWriter::new()?,
+        })
+    }
+
+    pub fn write_password(&self, data: &Zeroizing<String>) -> Result<()> {
+        debug!(
+            "Writing password \"{}\"",
+            <Zeroizing<String> as AsRef<str>>::as_ref(data),
+        );
+        self.iso_writer.add("password", data.deref().as_bytes())
+    }
+
+    pub fn write_share(&self, data: &Zeroizing<Share>) -> Result<()> {
+        debug!("Writing share: {:?}", data.deref());
+        self.iso_writer.add("share", data.deref().as_ref())
+    }
 
     /// Burn data to CD & eject disk when done.
     pub fn burn(self) -> Result<()> {
         use tempfile::NamedTempFile;
 
         let iso = NamedTempFile::new()?;
-        self.to_iso(&iso)?;
+        self.iso_writer.to_iso(&iso)?;
 
         let mut cmd = Command::new("cdrecord");
         let output = cmd
@@ -313,9 +320,9 @@ impl Cdw {
             .output()
             .with_context(|| {
                 format!(
-                    "failed to create ISO from \"{}\" at \"{}\"",
-                    self.tmp.as_ref().display(),
-                    self.tmp.as_ref().display()
+                    "failed to burn ISO \"{}\" to \"{}\"",
+                    iso.path().display(),
+                    self.device.display()
                 )
             })?;
 
