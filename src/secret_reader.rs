@@ -17,7 +17,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     backup::{Share, Verifier},
-    cdrw::Cdr,
+    cdrw::{Cdr, IsoReader},
 };
 
 #[derive(Args, Clone, Debug, Default, PartialEq)]
@@ -68,8 +68,7 @@ pub fn get_passwd_reader(
     Ok(match input.auth_method {
         SecretInput::Stdio => Box::new(StdioPasswordReader {}),
         SecretInput::Iso => {
-            let cdr = Cdr::new(input.auth_dev.as_ref())?;
-            Box::new(IsoPasswordReader::new(cdr))
+            Box::new(IsoPasswordReader::new(input.auth_dev.as_ref())?)
         }
         SecretInput::Cdr => {
             let cdr = Cdr::new(input.auth_dev.as_ref())?;
@@ -229,15 +228,12 @@ impl PasswordReader for CdrPasswordReader {
     // TODO: if this were to consume `self` we may be able to make
     // `Cdr::teardown` do the same ...
     fn read(&mut self, _prompt: &str) -> Result<Zeroizing<String>> {
-        self.cdr.mount()?;
-
         let password = self.cdr.read("password")?;
 
         // Passwords are utf8 and `String::from_utf8` explicitly does *not*
         // copy the Vec<u8>.
         let password = Zeroizing::new(String::from_utf8(password)?);
         debug!("read password: {:?}", password.deref());
-        self.cdr.teardown();
 
         Ok(password)
     }
@@ -277,14 +273,6 @@ impl Iterator for CdrShareReader {
             Err(e) => return Some(Err(e.into())),
         };
 
-        // TODO: retry loop
-        // a drive tested errors out very quickly if the drive is still
-        // reading the disk, another will just block until data is ready
-        // ¯\_(ツ)_/¯
-        match self.cdr.mount() {
-            Ok(()) => (),
-            Err(e) => return Some(Err(e)),
-        }
         let share = match self.cdr.read("share") {
             Ok(b) => b,
             Err(e) => return Some(Err(e)),
@@ -310,23 +298,31 @@ impl Iterator for CdrShareReader {
 }
 
 struct IsoPasswordReader {
-    cdr: Cdr,
+    iso: IsoReader,
 }
 
 impl IsoPasswordReader {
-    pub fn new(cdr: Cdr) -> Self {
-        Self { cdr }
+    pub fn new<P: AsRef<Path>>(iso: Option<P>) -> Result<Self> {
+        let iso = match iso {
+            None => {
+                let pwd = env::current_dir().context("Failed to get PWD")?;
+                pwd.join("password.iso")
+            }
+            Some(i) => i.as_ref().to_path_buf(),
+        };
+
+        Ok(Self {
+            iso: IsoReader::new(iso),
+        })
     }
 }
 
 impl PasswordReader for IsoPasswordReader {
     fn read(&mut self, _prompt: &str) -> Result<Zeroizing<String>> {
-        self.cdr.mount()?;
-
-        let password = self.cdr.read("password")?;
-        let password = Zeroizing::new(String::from_utf8(password)?);
+        let password =
+            Zeroizing::new(String::from_utf8(self.iso.read("password")?)?);
         debug!("read password: {:?}", password.deref());
-        self.cdr.teardown();
+
         Ok(password)
     }
 }
@@ -339,7 +335,6 @@ struct IsoShareReader {
 const SHARE_ISO_GLOB: &str = "share_*-of-*.iso";
 
 impl IsoShareReader {
-    // TODO: verifier
     pub fn new<P: AsRef<Path>>(
         dir: Option<P>,
         verifier: Verifier,
@@ -376,16 +371,9 @@ impl Iterator for IsoShareReader {
         };
 
         debug!("getting share from ISO: {}", share_iso.display());
-        let mut cdr = match Cdr::new(Some(share_iso)) {
-            Err(e) => return Some(Err(e)),
-            Ok(c) => c,
-        };
+        let iso = IsoReader::new(share_iso);
 
-        if let Err(e) = cdr.mount() {
-            return Some(Err(e));
-        }
-
-        let share = match cdr.read("share") {
+        let share = match iso.read("share") {
             Err(e) => return Some(Err(e)),
             Ok(s) => s,
         };
