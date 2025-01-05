@@ -8,6 +8,7 @@ use hex::ToHex;
 use std::{
     env,
     ffi::OsStr,
+    fmt,
     fs::{File, OpenOptions},
     io::Write,
     ops::Deref,
@@ -41,9 +42,9 @@ const CR: u8 = 0x0d;
 
 #[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq)]
 pub enum SecretOutput {
+    #[default]
     Cdw,
     Iso,
-    #[default]
     Printer,
 }
 
@@ -74,6 +75,12 @@ impl From<SecretOutput> for &str {
             SecretOutput::Iso => "iso",
             SecretOutput::Printer => "printer",
         }
+    }
+}
+
+impl fmt::Display for SecretOutput {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", <Self as Into<&str>>::into(*self))
     }
 }
 

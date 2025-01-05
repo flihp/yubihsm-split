@@ -9,6 +9,7 @@ use log::debug;
 use std::{
     env,
     ffi::OsStr,
+    fmt,
     io::{self, Read, Write},
     ops::Deref,
     path::{Path, PathBuf},
@@ -50,12 +51,18 @@ impl From<SecretInput> for &str {
     }
 }
 
+impl fmt::Display for SecretInput {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", <Self as Into<&str>>::into(*self))
+    }
+}
+
 // thread 'main' panicked at /home/flihp/.cargo/registry/src/index.crates.io-6f17d22bba15001f/clap_builder-4.5.18/src/builder/debug_asserts.rs:86:13:
 // Command change-auth: Argument names must be unique, but 'method' is in use by more than one argument or group
 // note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 #[derive(Args, Clone, Debug, Default, PartialEq)]
 pub struct AuthInputArg {
-    #[clap(long, env)]
+    #[clap(long, default_value_t, env)]
     auth_method: SecretInput,
 
     #[clap(long, env)]
