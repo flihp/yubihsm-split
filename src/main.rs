@@ -106,6 +106,7 @@ enum Command {
         #[command(subcommand)]
         command: HsmCommand,
     },
+<<<<<<< Updated upstream
     /// Execute the OKS provisioning ceremony in a single command. This
     /// is equivalent to executing `hsm initialize`, `hsm generate`,
     /// `ca initialize`, and `ca sign`.
@@ -132,6 +133,8 @@ enum Command {
         /// random one for them.
         passwd_challenge: bool,
     },
+=======
+>>>>>>> Stashed changes
 }
 
 #[derive(Subcommand, Debug, PartialEq)]
@@ -338,6 +341,7 @@ fn get_new_passwd(hsm: Option<&mut Hsm>) -> Result<Zeroizing<String>> {
     Ok(passwd)
 }
 
+<<<<<<< Updated upstream
 /// Perform all operations that make up the ceremony for provisioning an
 /// offline keystore.
 fn do_ceremony<P: AsRef<Path>>(
@@ -447,6 +451,8 @@ fn do_ceremony<P: AsRef<Path>>(
     )
 }
 
+=======
+>>>>>>> Stashed changes
 pub fn initialize_all_ca<P: AsRef<Path>>(
     key_spec: P,
     pkcs11_path: P,
@@ -970,6 +976,7 @@ fn main() -> Result<()> {
                 }
             }
         }
+<<<<<<< Updated upstream
         Command::Ceremony {
             ref csr_spec,
             ref key_spec,
@@ -984,5 +991,7 @@ fn main() -> Result<()> {
             passwd_challenge,
             &args,
         ),
+=======
+>>>>>>> Stashed changes
     }
 }
