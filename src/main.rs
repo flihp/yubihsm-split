@@ -4,6 +4,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use const_format::formatcp;
 use env_logger::Builder;
 use log::{debug, error, info, LevelFilter};
 use std::{
@@ -12,7 +13,7 @@ use std::{
     ffi::OsStr,
     fs,
     ops::{Deref, DerefMut},
-    path::{Path, PathBuf},
+    path::{Path, PathBuf, MAIN_SEPARATOR},
     str::FromStr,
 };
 use yubihsm::object::{Id, Type};
@@ -39,7 +40,9 @@ const PASSWD_NEW: &str = "Enter new password: ";
 const PASSWD_NEW_2: &str = "Enter password again to confirm: ";
 
 const INPUT_PATH: &str = "/usr/share/oks";
-const VERIFIER_PATH: &str = "/usr/share/oks/verifier.json";
+const VERIFIER_FILE: &str = "verifier.json";
+const VERIFIER_PATH: &str =
+    formatcp!("{}{}{}", INPUT_PATH, MAIN_SEPARATOR, VERIFIER_FILE);
 
 const OUTPUT_PATH: &str = "/var/lib/oks";
 const STATE_PATH: &str = "/var/lib/oks/ca-state";
@@ -369,13 +372,13 @@ fn do_ceremony<P: AsRef<Path>>(
         let (shares, verifier) = wrap.split(&mut hsm)?;
         let verifier = serde_json::to_string(&verifier)?;
         debug!("JSON: {}", verifier);
-        let verifier_path = args.output.join(VERIFIER_PATH);
+        let verifier_path = args.output.join(VERIFIER_FILE);
         debug!(
             "Serializing verifier as json to: {}",
             verifier_path.display()
         );
 
-        fs::write(verifier_path, verifier)?;
+        fs::write(verifier_path, verifier).context("Write verifier")?;
 
         println!(
             "\nWARNING: The wrap / backup key has been created and stored in the\n\
@@ -388,7 +391,11 @@ fn do_ceremony<P: AsRef<Path>>(
         );
 
         let secret_writer = secret_writer::get_writer(output)?;
-        for (i, share) in shares.as_ref().iter().enumerate() {
+        for (i, share) in
+            <Zeroizing<Vec<Share>> as AsRef<Vec<Share>>>::as_ref(&shares)
+                .iter()
+                .enumerate()
+        {
             let share_num = i + 1;
             println!(
                 "When key custodian {num} is ready, press enter to print share \
@@ -771,16 +778,19 @@ fn main() -> Result<()> {
 
                     debug!("Initialize");
                     let wrap = BackupKey::from_rng(&mut hsm)?;
-                    let (shares, verifier) = wrap.split(&mut hsm)?;
+                    // the compiler needs help w/ the type for `shares`
+                    let (shares, verifier): (Zeroizing<Vec<Share>>, _) =
+                        wrap.split(&mut hsm)?;
                     let verifier = serde_json::to_string(&verifier)?;
                     debug!("JSON: {}", verifier);
-                    let verifier_path = args.output.join(VERIFIER_PATH);
+                    let verifier_path = args.output.join(VERIFIER_FILE);
                     debug!(
                         "Serializing verifier as json to: {}",
                         verifier_path.display()
                     );
 
-                    fs::write(verifier_path, verifier)?;
+                    fs::write(&verifier_path, verifier)
+                        .context("Write verifier")?;
 
                     println!(
                         "\nWARNING: The wrap / backup key has been created and stored in the\n\
@@ -794,7 +804,7 @@ fn main() -> Result<()> {
 
                     let secret_writer =
                         secret_writer::get_writer(secret_method)?;
-                    for (i, share) in shares.as_ref().iter().enumerate() {
+                    for (i, share) in shares.iter().enumerate() {
                         let share_num = i + 1;
                         println!(
                             "When key custodian {num} is ready, press enter to print share \
@@ -925,7 +935,8 @@ fn main() -> Result<()> {
                     )?;
 
                     let verifier = fs::read_to_string(verifier)?;
-                    let verifier: Verifier = serde_json::from_str(&verifier)?;
+                    let verifier: Vec<Verifier> =
+                        serde_json::from_str(&verifier)?;
                     let share_itr = secret_reader::get_share_reader(
                         share_method,
                         verifier,
