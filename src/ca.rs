@@ -183,7 +183,7 @@ fn passwd_to_env(env_str: &str, password: &Zeroizing<String>) -> Result<()> {
     use std::ops::Deref;
 
     let password = Zeroizing::new(format!("0002{}", password.deref()));
-    std::env::set_var(env_str, password);
+std::env::set_var(env_str, password);
 
     Ok(())
 }

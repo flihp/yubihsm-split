@@ -9,7 +9,6 @@ use env_logger::Builder;
 use log::{debug, error, info, LevelFilter};
 use std::{
     collections::HashMap,
-    env,
     ffi::OsStr,
     fs,
     ops::{Deref, DerefMut},
@@ -55,14 +54,6 @@ const GEN_PASSWD_LENGTH: usize = 16;
 // when we write out signed certs to the file system this suffix is appended
 const CERT_SUFFIX: &str = "cert.pem";
 
-// string for environment variable used to pass in the authentication
-// password for the HSM
-pub const ENV_PASSWORD: &str = "OKS_PASSWORD";
-
-// string for environment variable used to pass in a NEW authentication
-// password for the HSM
-pub const ENV_NEW_PASSWORD: &str = "OKS_NEW_PASSWORD";
-
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 /// Create and restore split yubihsm wrap keys
@@ -83,6 +74,14 @@ struct Args {
     #[clap(long, env, default_value = "usb")]
     transport: Transport,
 
+    /// ID of authentication credential
+    #[clap(long, env)]
+    auth_id: Option<Id>,
+
+    /// Method used to get authentication values from the user
+    #[clap(flatten)]
+    auth_method: AuthInputArg,
+
     /// subcommands
     #[command(subcommand)]
     command: Command,
@@ -91,17 +90,10 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Command {
     Ca {
-        #[clap(flatten)]
-        auth_method: AuthInputArg,
-
         #[command(subcommand)]
         command: CaCommand,
     },
     Hsm {
-        /// ID of authentication credential
-        #[clap(long, env)]
-        auth_id: Option<Id>,
-
         /// Skip creation of a wrap key when initializing the HSM.
         #[clap(long, env)]
         no_backup: bool,
@@ -154,9 +146,6 @@ enum CaCommand {
 enum HsmCommand {
     /// Change the authentication value.
     ChangeAuth {
-        #[clap(flatten)]
-        auth_method: AuthInputArg,
-
         /// Challenge the caller for a new password, don't generate a
         /// random one for them.
         #[clap(long, env)]
@@ -168,9 +157,6 @@ enum HsmCommand {
 
     /// Generate keys in YubiHSM from specification.
     Generate {
-        #[clap(flatten)]
-        auth_method: AuthInputArg,
-
         #[clap(long, env, default_value = INPUT_PATH)]
         key_spec: PathBuf,
     },
@@ -202,10 +188,7 @@ enum HsmCommand {
     },
 
     /// Get serial number from YubiHSM and dump to console.
-    SerialNumber {
-        #[clap(flatten)]
-        auth_method: AuthInputArg,
-    },
+    SerialNumber,
 }
 
 fn make_dir(path: &Path) -> Result<()> {
@@ -226,98 +209,32 @@ fn make_dir(path: &Path) -> Result<()> {
     }
 }
 
-/// Get auth_id, pick reasonable defaults if not set.
-fn get_auth_id(auth_id: Option<Id>, command: &HsmCommand) -> Id {
-    match auth_id {
-        // if auth_id is set by the caller we use that value
-        Some(a) => a,
-        None => match command {
-            // for these HSM commands we assume YubiHSM2 is in its
-            // default state and we use the default auth credentials:
-            // auth_id 1
-            HsmCommand::Initialize { .. }
-            | HsmCommand::Restore { .. }
-            | HsmCommand::SerialNumber { .. } => 1,
-            // otherwise we assume the auth key that we create is
-            // present: auth_id 2
-            _ => 2,
-        },
-    }
-}
-
-/// Get password either from environment, the YubiHSM2 default, or challenge
-/// the user with a password prompt.
-fn get_passwd(
-    auth_id: Option<Id>,
-    auth_method: &AuthInputArg,
-    command: &HsmCommand,
-) -> Result<Zeroizing<String>> {
-    let passwd = match env::var(ENV_PASSWORD).ok() {
-        Some(s) => Zeroizing::new(s),
-        None => {
-            let mut passwd_reader =
-                secret_reader::get_passwd_reader(auth_method)?;
-
-            if auth_id.is_some() {
-                // if auth_id was set by the caller but not the password we
-                // prompt for the password
-                passwd_reader.read(PASSWD_PROMPT)?
-            } else {
-                match command {
-                    // if password isn't set, auth_id isn't set, and
-                    // the command is one of these, we assume the
-                    // YubiHSM2 is in its default state so we use the
-                    // default password
-                    HsmCommand::Initialize { .. }
-                    | HsmCommand::Restore { .. }
-                    | HsmCommand::SerialNumber { .. } => {
-                        Zeroizing::new("password".to_string())
-                    }
-                    // otherwise prompt the user for the password
-                    _ => passwd_reader.read(PASSWD_PROMPT)?,
-                }
-            }
-        }
-    };
-
-    Ok(passwd)
-}
-
 /// get a new password from the environment or by issuing a challenge the user
 fn get_new_passwd(hsm: Option<&mut Hsm>) -> Result<Zeroizing<String>> {
-    let passwd = match env::var(ENV_NEW_PASSWORD).ok() {
-        // prefer new password from env above all else
-        Some(s) => {
-            info!("got password from env");
-            Zeroizing::new(s)
+    match hsm {
+        // use the HSM otherwise if available
+        Some(hsm) => {
+            info!("Generating random password");
+            let alpha = Alphabet::default();
+            let password =
+                alpha.get_random_string(&mut *hsm, GEN_PASSWD_LENGTH)?;
+            Ok(Zeroizing::new(password))
         }
-        None => match hsm {
-            // use the HSM otherwise if available
-            Some(hsm) => {
-                info!("Generating random password");
-                let alpha = Alphabet::default();
-                let password =
-                    alpha.get_random_string(&mut *hsm, GEN_PASSWD_LENGTH)?;
-                Zeroizing::new(password)
-            }
-            // last option: challenge the caller
-            None => {
-                let mut passwd_reader = StdioPasswordReader::default();
-                loop {
-                    let password = passwd_reader.read(PASSWD_NEW)?;
-                    let password2 = passwd_reader.read(PASSWD_NEW_2)?;
-                    if password != password2 {
-                        error!("the passwords entered do not match");
-                    } else {
-                        debug!("got the same password twice");
-                        break password;
-                    }
+        // last option: challenge the caller
+        None => {
+            let mut passwd_reader = StdioPasswordReader::default();
+            loop {
+                let password = passwd_reader.read(PASSWD_NEW)?;
+                let password2 = passwd_reader.read(PASSWD_NEW_2)?;
+                if password != password2 {
+                    error!("the passwords entered do not match");
+                } else {
+                    debug!("got the same password twice");
+                    break Ok(password);
                 }
             }
-        },
-    };
-
-    Ok(passwd)
+        }
+    }
 }
 
 pub fn initialize_all_ca<P: AsRef<Path>>(
@@ -577,19 +494,54 @@ fn main() -> Result<()> {
     };
     builder.filter(None, level).init();
 
+    // Select default for auth-id based on the command selected by the caller.
+    // We assume the YubiHSM is in its default state when `hsm initialize` or
+    // `hsm restore` is called. All other commands assume auth-id 2.
+    let auth_id = match args.auth_id {
+        Some(a) => a,
+        None => match args.command {
+            // if no auth-id is provided for a `ca` command
+            Command::Ca { .. } => 2,
+            Command::Hsm { ref command, .. } => match command {
+                HsmCommand::Initialize { .. }
+                | HsmCommand::Restore { .. } => 1,
+                _ => 2,
+            }
+        }
+    };
+
+    let password = loop {
+        let password = if auth_id != 1 {
+            // get auth method
+            let mut passwd_reader = secret_reader::get_passwd_reader(&args.auth_method)?;
+            // use auth method to get passwd
+            passwd_reader.read(PASSWD_PROMPT)?
+        } else {
+            Zeroizing::new("password".to_string())
+        };
+        // if auth_id == 1 then we ignore the auth method ... not sure how I
+        // feel about this but the alternative is to require the caller enter
+        // an auth value and that makes things more difficult.
+        // check that the password works
+        match Hsm::new(
+            auth_id,
+            &password,
+            args.output.as_ref(),
+            args.state.as_ref(),
+            false,
+            args.transport,
+        ) {
+            Ok(_) => break password,
+            Err(_) => println!("auth failed, try again"),
+        }
+    };
+
     make_dir(&args.output)?;
     make_dir(&args.state)?;
     make_dir(&Path::new(&args.state).join(DAC_DIR))?;
 
     match args.command {
-        Command::Ca {
-            auth_method,
-            command,
-        } => {
-            let mut passwd_reader =
-                secret_reader::get_passwd_reader(&auth_method)?;
-            let password = passwd_reader.read(PASSWD_PROMPT)?;
-
+        Command::Ca { command } => {
             match command {
                 CaCommand::Initialize {
                     key_spec,
@@ -618,7 +570,6 @@ fn main() -> Result<()> {
             }
         }
         Command::Hsm {
-            auth_id,
             command,
             no_backup,
         } => {
@@ -698,16 +649,12 @@ fn main() -> Result<()> {
                     hsm.replace_default_auth(&passwd_new)
                 }
                 HsmCommand::ChangeAuth {
-                    ref auth_method,
                     passwd_challenge,
                     ref secret_method,
                 } => {
-                    // authenticate using the existing credentials (auth-id 2)
-                    let passwd = get_passwd(auth_id, auth_method, &command)?;
-                    let auth_id = get_auth_id(auth_id, &command);
                     let mut hsm = Hsm::new(
                         auth_id,
-                        &passwd,
+                        &password,
                         &args.output,
                         &args.state,
                         !no_backup,
@@ -736,13 +683,13 @@ fn main() -> Result<()> {
                     }
 
                     // move auth value to id 3 & remove from id 2
-                    hsm.add_auth(3, &passwd)?;
+                    hsm.add_auth(3, &password)?;
                     hsm.delete_auth(auth_id)?;
 
                     // auth w/ same passwd but auth-id 3 this time
                     let hsm = Hsm::new(
                         3,
-                        &passwd,
+                        &password,
                         &args.output,
                         &args.state,
                         !no_backup,
@@ -761,14 +708,11 @@ fn main() -> Result<()> {
                     Ok(())
                 }
                 HsmCommand::Generate {
-                    ref auth_method,
                     ref key_spec,
                 } => {
-                    let passwd = get_passwd(auth_id, auth_method, &command)?;
-                    let auth_id = get_auth_id(auth_id, &command);
                     let hsm = Hsm::new(
                         auth_id,
-                        &passwd,
+                        &password,
                         &args.output,
                         &args.state,
                         !no_backup,
@@ -827,12 +771,10 @@ fn main() -> Result<()> {
                     info!("Deleting default authentication key");
                     oks::hsm::delete(&hsm.client, 1, Type::AuthenticationKey)
                 }
-                HsmCommand::SerialNumber { ref auth_method } => {
-                    let passwd = get_passwd(auth_id, auth_method, &command)?;
-                    let auth_id = get_auth_id(auth_id, &command);
+                HsmCommand::SerialNumber => {
                     let hsm = Hsm::new(
                         auth_id,
-                        &passwd,
+                        &password,
                         &args.output,
                         &args.state,
                         !no_backup,
